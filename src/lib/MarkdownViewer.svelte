@@ -167,14 +167,17 @@
 		for (const img of doc.querySelectorAll('img')) {
 			const src = img.getAttribute('src');
 			if (src && !src.startsWith('http') && !src.startsWith('data:')) {
-				// Decode URL-encoded paths (especially for .attachment/ files)
-				// Split path, decode filename part only
-				const pathParts = src.split('/');
-				const encodedFilename = pathParts.pop() || '';
-				const decodedFilename = decodeURIComponent(encodedFilename);
-				const decodedSrc = [...pathParts, decodedFilename].join('/');
+				// For .attachment/ paths: keep as-is (already manually URL-encoded)
+				// For other paths: decode them normally
+				let processedSrc = src;
+				if (!src.startsWith('.attachment/')) {
+					const pathParts = src.split('/');
+					const encodedFilename = pathParts.pop() || '';
+					const decodedFilename = decodeURIComponent(encodedFilename);
+					processedSrc = [...pathParts, decodedFilename].join('/');
+				}
 
-				img.setAttribute('src', convertFileSrc(resolvePath(filePath, decodedSrc)));
+				img.setAttribute('src', convertFileSrc(resolvePath(filePath, processedSrc)));
 			} else if (src && isYoutubeLink(src)) {
 				const videoId = getYoutubeId(src);
 				if (videoId) replaceWithYoutubeEmbed(img, videoId);
@@ -628,6 +631,15 @@
 		return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext || '');
 	}
 
+	// Manual UTF-8 percent encoding (encodeURIComponent is unreliable in Tauri)
+	function manualEncodeURIComponent(str: string): string {
+		const encoder = new TextEncoder();
+		const bytes = encoder.encode(str);
+		return Array.from(bytes)
+			.map(byte => '%' + byte.toString(16).toUpperCase().padStart(2, '0'))
+			.join('');
+	}
+
 	function sanitizeFilename(filename: string): string {
 		const basename = filename.split(/[/\\]/).pop() || 'file';
 
@@ -639,8 +651,8 @@
 		// Remove filesystem forbidden chars
 		const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '');
 
-		// Encode ALL non-alphanumeric characters (spaces, -, _, parentheses, Unicode, etc.)
-		// This prevents double-encoding issues with Tauri's convertFileSrc()
+		// Encode ALL non-alphanumeric characters using manual UTF-8 encoding
+		// encodeURIComponent is unreliable in Tauri environment
 		const safeName = Array.from(cleaned)
 			.map(char => {
 				const code = char.charCodeAt(0);
@@ -650,8 +662,8 @@
 					(code >= 97 && code <= 122)) {  // a-z
 					return char;
 				}
-				// Encode everything else (including Unicode like 한글)
-				return encodeURIComponent(char);
+				// Manually encode everything else
+				return manualEncodeURIComponent(char);
 			})
 			.join('')
 			.substring(0, 200); // Allow longer names for encoded Unicode
