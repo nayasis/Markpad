@@ -7,6 +7,14 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri::menu::ContextMenu;
 use regex::{Regex, Captures};
 use std::borrow::Cow;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct CleanupResult {
+    deleted_count: usize,
+    used_files: Vec<String>,
+    checked_files: Vec<String>,
+}
 
 
 struct WatcherState {
@@ -284,6 +292,182 @@ fn open_file(path: String) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[tauri::command]
+fn cleanup_unused_attachments(
+    document_path: String,
+    content: String
+) -> Result<CleanupResult, String> {
+    use std::path::Path;
+    use std::collections::HashSet;
+
+    // Validate document path
+    let doc_path = Path::new(&document_path);
+    if !doc_path.exists() {
+        return Ok(CleanupResult {
+            deleted_count: 0,
+            used_files: vec![],
+            checked_files: vec![],
+        });
+    }
+
+    let doc_dir = doc_path.parent()
+        .ok_or("Invalid document path")?;
+    let attach_dir = doc_dir.join(".attachment");
+
+    // If .attachment directory doesn't exist, nothing to clean up
+    if !attach_dir.exists() {
+        return Ok(CleanupResult {
+            deleted_count: 0,
+            used_files: vec![],
+            checked_files: vec![],
+        });
+    }
+
+    // Helper function to generate all possible path variations (URL-encoded/decoded)
+    fn add_path_variations(set: &mut HashSet<String>, path: &str) {
+        // Add original path
+        set.insert(path.to_string());
+
+        // Add fully decoded path
+        if let Ok(decoded) = urlencoding::decode(path) {
+            let decoded_str = decoded.to_string();
+            if decoded_str != path {
+                set.insert(decoded_str);
+            }
+        }
+
+        // Add path with only filename decoded (keep directory path as-is)
+        if let Some(slash_pos) = path.rfind('/') {
+            let (dir, file) = path.split_at(slash_pos + 1);
+            if let Ok(decoded_file) = urlencoding::decode(file) {
+                let decoded_file_str = decoded_file.to_string();
+                if decoded_file_str != file {
+                    set.insert(format!("{}{}", dir, decoded_file_str));
+                }
+            }
+        }
+
+        // Add path with only directory decoded (keep filename as-is)
+        if let Some(slash_pos) = path.rfind('/') {
+            let (dir, file) = path.split_at(slash_pos + 1);
+            if let Ok(decoded_dir) = urlencoding::decode(dir) {
+                let decoded_dir_str = decoded_dir.to_string();
+                if decoded_dir_str != dir {
+                    set.insert(format!("{}{}", decoded_dir_str, file));
+                }
+            }
+        }
+    }
+
+    // Extract all attachment paths referenced in the document
+    let mut used_files = HashSet::new();
+
+    // Pattern 1: Markdown links/images with .attachment paths
+    // Matches: ](.attachment/path/file.ext) - captures up to file extension, handles parentheses in filenames
+    let link_re = Regex::new(r"\]\((\.attachment/.*?\.(?:jpg|jpeg|png|gif|bmp|webp|svg|pdf|doc|docx|xls|xlsx|ppt|pptx|txt|md|zip|rar|7z|tar|gz|mp3|mp4|avi|mov))\)").unwrap();
+    for caps in link_re.captures_iter(&content) {
+        if let Some(path) = caps.get(1) {
+            let path_str = path.as_str().trim();
+            add_path_variations(&mut used_files, path_str);
+        }
+    }
+
+    // Pattern 2: Obsidian embeds ![[.attachment/path]] or ![[.attachment/path|size]]
+    // This pattern doesn't have the parenthesis problem
+    let obsidian_re = Regex::new(r"!\[\[(\.attachment/.*?\.(?:jpg|jpeg|png|gif|bmp|webp|svg|pdf|doc|docx|xls|xlsx|ppt|pptx|txt|md|zip|rar|7z|tar|gz|mp3|mp4|avi|mov))(?:\|[^\]]+)?\]\]").unwrap();
+    for caps in obsidian_re.captures_iter(&content) {
+        if let Some(path) = caps.get(1) {
+            let path_str = path.as_str().trim();
+            add_path_variations(&mut used_files, path_str);
+        }
+    }
+
+    // Walk through .attachment directory and find unused files
+    let mut deleted_count = 0;
+    let mut checked_files = Vec::new();
+
+    fn walk_dir(dir: &Path, base: &Path, used: &HashSet<String>, deleted: &mut usize, checked: &mut Vec<String>) -> Result<(), String> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+
+        let entries = fs::read_dir(dir)
+            .map_err(|e| format!("Failed to read directory: {}", e))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+            let path = entry.path();
+
+            if path.is_dir() {
+                walk_dir(&path, base, used, deleted, checked)?;
+            } else if path.is_file() {
+                // Get relative path from document directory
+                let rel_path = path.strip_prefix(base)
+                    .map_err(|e| format!("Failed to get relative path: {}", e))?;
+                let rel_path_str = rel_path.to_string_lossy()
+                    .replace("\\", "/");
+
+                checked.push(rel_path_str.clone());
+
+                // Check if this file is used in the document
+                if !used.contains(&rel_path_str) {
+                    // Delete unused file
+                    if let Err(_e) = fs::remove_file(&path) {
+                        // Ignore deletion errors
+                    } else {
+                        *deleted += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    walk_dir(&attach_dir, doc_dir, &used_files, &mut deleted_count, &mut checked_files)?;
+
+    // Clean up empty directories
+    fn remove_empty_dirs(dir: &Path) -> Result<(), String> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+
+        let entries = fs::read_dir(dir)
+            .map_err(|e| format!("Failed to read directory: {}", e))?;
+
+        let mut has_files = false;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+            let path = entry.path();
+
+            if path.is_dir() {
+                remove_empty_dirs(&path)?;
+                // Check if dir still exists after recursive cleanup
+                if path.exists() {
+                    has_files = true;
+                }
+            } else {
+                has_files = true;
+            }
+        }
+
+        // Remove directory if empty
+        if !has_files {
+            let _ = fs::remove_dir(dir);
+        }
+
+        Ok(())
+    }
+
+    let _ = remove_empty_dirs(&attach_dir);
+
+    Ok(CleanupResult {
+        deleted_count,
+        used_files: used_files.into_iter().collect(),
+        checked_files,
+    })
 }
 
 struct AppState {
@@ -609,6 +793,7 @@ pub fn run() {
             copy_file_to_attachment,
             save_clipboard_image,
             open_file,
+            cleanup_unused_attachments,
 
             show_context_menu,
             show_window

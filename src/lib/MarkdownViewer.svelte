@@ -348,6 +348,37 @@
 			throwOnError: false,
 		});
 
+		// Handle Obsidian-style image sizing in alt text
+		// Supports: ![alt|width](path) or ![alt|widthxheight](path)
+		const images = markdownBody.querySelectorAll('img');
+		images.forEach((img) => {
+			const alt = img.getAttribute('alt');
+			if (!alt) return;
+
+			// Check if alt contains size parameter (e.g., "image|400" or "image|400x300")
+			const pipeIndex = alt.lastIndexOf('|');
+			if (pipeIndex === -1) return;
+
+			const actualAlt = alt.substring(0, pipeIndex);
+			const sizeParam = alt.substring(pipeIndex + 1).trim();
+
+			if (!sizeParam) return;
+
+			// Parse size parameter
+			if (sizeParam.includes('x')) {
+				// Format: widthxheight (e.g., "400x300")
+				const [width, height] = sizeParam.split('x');
+				if (width) img.setAttribute('width', width);
+				if (height) img.setAttribute('height', height);
+			} else {
+				// Format: width only (e.g., "400")
+				img.setAttribute('width', sizeParam);
+			}
+
+			// Update alt text to remove size parameter
+			img.setAttribute('alt', actualAlt);
+		});
+
 		// Handle attachment links
 		const attachmentLinks = markdownBody.querySelectorAll('a[href^=".attachment/"]');
 		attachmentLinks.forEach((link) => {
@@ -605,22 +636,32 @@
 		const name = lastDotIndex > 0 ? basename.slice(0, lastDotIndex) : basename;
 		const ext = lastDotIndex > 0 ? basename.slice(lastDotIndex) : '';
 
-		// Remove only filesystem forbidden characters
-		// Keep Unicode characters (Korean, Japanese, Chinese, etc.)
-		// Windows: < > : " / \ | ? *
-		let safeName = name
-			.replace(/[<>:"/\\|?*\x00-\x1F]/g, '') // Remove forbidden chars
-			.replace(/\s+/g, '_') // Replace spaces with underscore
-			.replace(/_{2,}/g, '_') // Replace consecutive underscores with single
-			.replace(/^[.\s_]+|[.\s_]+$/g, '') // Remove leading/trailing dots, spaces, underscores
-			.substring(0, 100);
+		// Remove filesystem forbidden chars
+		const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '');
+
+		// Encode ALL non-alphanumeric characters (spaces, -, _, parentheses, Unicode, etc.)
+		// This prevents double-encoding issues with Tauri's convertFileSrc()
+		const safeName = Array.from(cleaned)
+			.map(char => {
+				const code = char.charCodeAt(0);
+				// Keep only: a-z, A-Z, 0-9
+				if ((code >= 48 && code <= 57) ||   // 0-9
+					(code >= 65 && code <= 90) ||   // A-Z
+					(code >= 97 && code <= 122)) {  // a-z
+					return char;
+				}
+				// Encode everything else (including Unicode like 한글)
+				return encodeURIComponent(char);
+			})
+			.join('')
+			.substring(0, 200); // Allow longer names for encoded Unicode
 
 		// Use timestamp if filename is too short
 		if (safeName.length < 2) {
 			const now = new Date();
 			const dateStr = now.toISOString().slice(0, 19).replace(/[-:T]/g, '').replace(/(\d{8})(\d{6})/, '$1_$2');
 			const randomStr = Math.random().toString(36).substring(2, 10);
-			safeName = `${dateStr}_${randomStr}`;
+			return `${dateStr}_${randomStr}${ext}`;
 		}
 
 		return safeName + ext;
@@ -652,18 +693,16 @@
 				});
 
 				// Use original filename for alt text (remove extension)
+				// Now safe to use original name since filename is URL-encoded
 				const nameWithoutExt = originalFilename.replace(/\.[^/.]+$/, '');
 
-				// URL-encode the path for markdown compatibility
-				// Keep path separators, encode only the filename
-				const pathParts = relativePath.split('/');
-				const filename = pathParts.pop() || '';
-				const encodedPath = [...pathParts, encodeURIComponent(filename)].join('/');
+				// relativePath already contains URL-encoded filename from sanitizeFilename
+				// No need to encode again (would cause double encoding)
 
-				// Insert as Markdown syntax with URL-encoded path
+				// Insert as Markdown syntax
 				const text = isImage
-					? `![${nameWithoutExt}](${encodedPath})`
-					: `[${originalFilename}](${encodedPath})`;
+					? `![${nameWithoutExt}](${relativePath})`
+					: `[${originalFilename}](${relativePath})`;
 
 				// Insert text into Editor component
 				editorComponent?.insertText(text);
@@ -820,6 +859,18 @@
 				saveRecentFile(targetPath);
 			}
 			tab.isDirty = false;
+
+			// Clean up unused attachment files
+			try {
+				await invoke('cleanup_unused_attachments', {
+					documentPath: targetPath,
+					content: tab.rawContent
+				});
+			} catch (cleanupError) {
+				// Don't fail the save operation if cleanup fails
+				console.warn('Failed to cleanup attachments:', cleanupError);
+			}
+
 			return true;
 		} catch (e) {
 			console.error('Failed to save file', e);

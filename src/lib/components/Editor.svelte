@@ -516,20 +516,8 @@
 					filename
 				});
 
-				// Use timestamp as alt text
-				const timestamp = new Date().toLocaleString('ko-KR', {
-					year: 'numeric', month: '2-digit', day: '2-digit',
-					hour: '2-digit', minute: '2-digit', second: '2-digit'
-				}).replace(/\. /g, '-').replace(/:/g, '-');
-
-				// URL-encode the path for markdown compatibility
-				// Keep path separators, encode only the filename
-				const pathParts = relativePath.split('/');
-				const filenameFromPath = pathParts.pop() || '';
-				const encodedPath = [...pathParts, encodeURIComponent(filenameFromPath)].join('/');
-
-				// Insert as Markdown syntax with URL-encoded path
-				const markdownText = `![image ${timestamp}](${encodedPath})`;
+				// Insert as Obsidian embed syntax
+				const markdownText = `![[${relativePath}]]`;
 				insertText(markdownText);
 
 			} catch (error) {
