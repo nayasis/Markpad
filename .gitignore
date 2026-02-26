@@ -12,4 +12,8 @@ test.md
 test_image.png
 src-tauri/output.txt
 test_obsidian.md
-
+nul
+docs/.pdca-snapshots/*
+docs/.bkit-memory.json
+docs/.pdca-status.json
+CLAUDE.md

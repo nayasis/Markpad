@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 	import { listen } from '@tauri-apps/api/event';
+	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { onMount, tick, untrack } from 'svelte';
 	import { fly } from 'svelte/transition';
 	import { openUrl } from '@tauri-apps/plugin-opener';
@@ -51,6 +52,7 @@
 
 	let showHome = $state(false);
 	let isFullWidth = $state(localStorage.getItem('isFullWidth') === 'true');
+	let editorComponent = $state();
 
 	$effect(() => {
 		localStorage.setItem('isFullWidth', String(isFullWidth));
@@ -165,7 +167,14 @@
 		for (const img of doc.querySelectorAll('img')) {
 			const src = img.getAttribute('src');
 			if (src && !src.startsWith('http') && !src.startsWith('data:')) {
-				img.setAttribute('src', convertFileSrc(resolvePath(filePath, src)));
+				// Decode URL-encoded paths (especially for .attachment/ files)
+				// Split path, decode filename part only
+				const pathParts = src.split('/');
+				const encodedFilename = pathParts.pop() || '';
+				const decodedFilename = decodeURIComponent(encodedFilename);
+				const decodedSrc = [...pathParts, decodedFilename].join('/');
+
+				img.setAttribute('src', convertFileSrc(resolvePath(filePath, decodedSrc)));
 			} else if (src && isYoutubeLink(src)) {
 				const videoId = getYoutubeId(src);
 				if (videoId) replaceWithYoutubeEmbed(img, videoId);
@@ -337,6 +346,54 @@
 				{ left: '\\[', right: '\\]', display: true },
 			],
 			throwOnError: false,
+		});
+
+		// Handle attachment links
+		const attachmentLinks = markdownBody.querySelectorAll('a[href^=".attachment/"]');
+		attachmentLinks.forEach((link) => {
+			const anchor = link as HTMLAnchorElement;
+			const rawHref = anchor.getAttribute('href');
+			if (!rawHref) return;
+
+			// Remove existing listener if any
+			const oldListener = (anchor as any)._attachmentClickHandler;
+			if (oldListener) {
+				anchor.removeEventListener('click', oldListener);
+			}
+
+			// Add new listener
+			const handler = async (e: MouseEvent) => {
+				e.preventDefault();
+				e.stopPropagation();
+
+				const currentTab = tabManager.activeTab;
+				if (!currentTab?.path) {
+					console.error('Cannot open attachment: no current document path');
+					return;
+				}
+
+				// Decode URL-encoded path before resolving
+				// Split path, decode filename part only
+				const pathParts = rawHref.split('/');
+				const encodedFilename = pathParts.pop() || '';
+				const decodedFilename = decodeURIComponent(encodedFilename);
+				const decodedHref = [...pathParts, decodedFilename].join('/');
+
+				const resolved = resolvePath(currentTab.path, decodedHref);
+
+				try {
+					await invoke('open_file', { path: resolved });
+				} catch (error) {
+					console.error('Failed to open attachment:', error);
+					await askCustom(
+						`Failed to open file: ${error}`,
+						{ title: 'Error', kind: 'error' }
+					);
+				}
+			};
+
+			anchor.addEventListener('click', handler);
+			(anchor as any)._attachmentClickHandler = handler;
 		});
 	}
 
@@ -533,6 +590,122 @@
 			else parts.push(p);
 		}
 		return parts.join('/');
+	}
+
+	function isImageFile(filename: string): boolean {
+		const ext = filename.split('.').pop()?.toLowerCase();
+		return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext || '');
+	}
+
+	function sanitizeFilename(filename: string): string {
+		const basename = filename.split(/[/\\]/).pop() || 'file';
+
+		// Separate filename and extension
+		const lastDotIndex = basename.lastIndexOf('.');
+		const name = lastDotIndex > 0 ? basename.slice(0, lastDotIndex) : basename;
+		const ext = lastDotIndex > 0 ? basename.slice(lastDotIndex) : '';
+
+		// Remove only filesystem forbidden characters
+		// Keep Unicode characters (Korean, Japanese, Chinese, etc.)
+		// Windows: < > : " / \ | ? *
+		let safeName = name
+			.replace(/[<>:"/\\|?*\x00-\x1F]/g, '') // Remove forbidden chars
+			.replace(/\s+/g, '_') // Replace spaces with underscore
+			.replace(/_{2,}/g, '_') // Replace consecutive underscores with single
+			.replace(/^[.\s_]+|[.\s_]+$/g, '') // Remove leading/trailing dots, spaces, underscores
+			.substring(0, 100);
+
+		// Use timestamp if filename is too short
+		if (safeName.length < 2) {
+			const now = new Date();
+			const dateStr = now.toISOString().slice(0, 19).replace(/[-:T]/g, '').replace(/(\d{8})(\d{6})/, '$1_$2');
+			const randomStr = Math.random().toString(36).substring(2, 10);
+			safeName = `${dateStr}_${randomStr}`;
+		}
+
+		return safeName + ext;
+	}
+
+	async function handleEditorFileDrop(paths: string[]) {
+		const currentTab = tabManager.activeTab;
+		if (!currentTab?.path) {
+			await askCustom(
+				'Please save the document first before dropping files.',
+				{ title: 'Save Required', kind: 'warning' }
+			);
+			return;
+		}
+
+		let insertedCount = 0;
+
+		for (const sourcePath of paths) {
+			try {
+				const originalFilename = sourcePath.split(/[/\\]/).pop() || 'file';
+				const isImage = isImageFile(originalFilename);
+				const targetFilename = sanitizeFilename(originalFilename);
+
+				const relativePath = await invoke<string>('copy_file_to_attachment', {
+					sourcePath,
+					documentPath: currentTab.path,
+					targetFilename,
+					isImage
+				});
+
+				// Use original filename for alt text (remove extension)
+				const nameWithoutExt = originalFilename.replace(/\.[^/.]+$/, '');
+
+				// URL-encode the path for markdown compatibility
+				// Keep path separators, encode only the filename
+				const pathParts = relativePath.split('/');
+				const filename = pathParts.pop() || '';
+				const encodedPath = [...pathParts, encodeURIComponent(filename)].join('/');
+
+				// Insert as Markdown syntax with URL-encoded path
+				const text = isImage
+					? `![${nameWithoutExt}](${encodedPath})`
+					: `[${originalFilename}](${encodedPath})`;
+
+				// Insert text into Editor component
+				editorComponent?.insertText(text);
+				insertedCount++;
+
+			} catch (error) {
+				console.error('Failed to copy file:', error);
+				await askCustom(
+					`Failed to add file: ${error}`,
+					{ title: 'Error', kind: 'error' }
+				);
+			}
+		}
+
+		// Focus window and editor after all files are processed
+		if (insertedCount > 0) {
+			await tick(); // Wait for DOM updates
+
+			// Focus Tauri window at OS level - try multiple times with delay
+			try {
+				const appWindow = getCurrentWindow();
+
+				// First attempt - immediate
+				await appWindow.setFocus();
+
+				// Second attempt - with delay to overcome drag event focus steal
+				setTimeout(async () => {
+					try {
+						await appWindow.setFocus();
+						editorComponent?.focus();
+					} catch (e) {
+						console.error('Failed delayed window focus:', e);
+					}
+				}, 100);
+
+			} catch (error) {
+				console.error('Failed to focus window:', error);
+			}
+
+			// Focus Monaco editor immediately
+			editorComponent?.focus();
+		}
 	}
 
 	function isYoutubeLink(url: string) {
@@ -973,7 +1146,6 @@
 		invoke('show_window').catch(console.error);
 
 		const init = async () => {
-			const { getCurrentWindow } = await import('@tauri-apps/api/window');
 			const appWindow = getCurrentWindow();
 			const appMode = (await invoke('get_app_mode')) as any;
 
@@ -1111,16 +1283,22 @@
 
 			unlisteners.push(
 				await appWindow.onDragDropEvent((event) => {
-					if (isEditing) {
-						isDragging = false;
-						return;
-					}
-
 					if (event.payload.type === 'enter' || event.payload.type === 'over') {
 						isDragging = true;
 					} else if (event.payload.type === 'drop') {
 						isDragging = false;
-						event.payload.paths.forEach((path) => loadMarkdown(path));
+
+						const currentTab = tabManager.activeTab;
+						// Editor is visible in both full edit mode (isEditing) and split view mode (isSplit)
+						const shouldAttachFile = currentTab && (currentTab.isEditing || currentTab.isSplit);
+
+						if (shouldAttachFile) {
+							// Editor mode or Split view: attach files
+							handleEditorFileDrop(event.payload.paths);
+						} else {
+							// Viewer mode: open files (default behavior)
+							event.payload.paths.forEach((path) => loadMarkdown(path));
+						}
 					} else {
 						isDragging = false;
 					}
@@ -1231,6 +1409,7 @@
 					<div class="pane editor-pane" class:active={isEditing || isSplit} style="flex: {isSplit ? tabManager.activeTab.splitRatio : isEditing ? 1 : 0}">
 						{#if isEditing || isSplit}
 							<Editor
+								bind:this={editorComponent}
 								bind:value={tabManager.activeTab.rawContent}
 								language={editorLanguage}
 								{theme}
@@ -1284,7 +1463,7 @@
 		onsave={handleModalSave}
 		oncancel={handleModalCancel} />
 
-	{#if isDragging && !isEditing}
+	{#if isDragging && !isEditing && !isSplit}
 		<div class="drag-overlay" role="presentation">
 			<div class="drag-message">
 				<svg

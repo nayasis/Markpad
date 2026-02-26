@@ -2,6 +2,8 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { tabManager } from '../stores/tabs.svelte.js';
 	import { settings } from '../stores/settings.svelte.js';
+	import { invoke } from '@tauri-apps/api/core';
+	import { message } from '@tauri-apps/plugin-dialog';
 
 	import * as monaco from 'monaco-editor';
 	import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
@@ -57,6 +59,29 @@
 	let wordCount = $state(0);
 	let currentLanguage = $state('markdown');
 	const currentTabId = tabManager.activeTabId;
+
+	// Export method to insert text at cursor position
+	export function insertText(text: string) {
+		if (!editor) return;
+
+		const selection = editor.getSelection();
+		if (!selection) return;
+
+		editor.executeEdits('insert-text', [{
+			range: selection,
+			text: text,
+			forceMoveMarkers: true
+		}]);
+
+		editor.focus();
+	}
+
+	// Export method to focus editor
+	export function focus() {
+		if (editor) {
+			editor.focus();
+		}
+	}
 
 	self.MonacoEnvironment = {
 		getWorker: function (_moduleId: any, label: string) {
@@ -416,6 +441,47 @@
 			},
 		});
 
+		// Custom paste handler for images (Ctrl+V / Cmd+V)
+		editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, async () => {
+			const currentTab = tabManager.activeTab;
+
+			try {
+				// Read clipboard using ClipboardItem API
+				const clipboardItems = await navigator.clipboard.read();
+
+				// Check for images first (only for saved documents)
+				if (currentTab?.path) {
+					for (const item of clipboardItems) {
+						// Check if clipboard contains image
+						const imageType = item.types.find(type => type.startsWith('image/'));
+						if (imageType) {
+							const blob = await item.getType(imageType);
+							await handleImagePaste(blob, currentTab.path);
+							return; // Image handled, done
+						}
+					}
+				}
+
+				// No image found or unsaved document - paste text manually
+				const text = await navigator.clipboard.readText();
+				if (text) {
+					insertText(text);
+				}
+
+			} catch (error) {
+				console.error('Clipboard read error:', error);
+				// Try text paste as fallback
+				try {
+					const text = await navigator.clipboard.readText();
+					if (text) {
+						insertText(text);
+					}
+				} catch (e) {
+					console.error('Text paste failed:', e);
+				}
+			}
+		});
+
 		const wheelListener = (e: WheelEvent) => {
 			if (e.ctrlKey || e.metaKey) {
 				e.preventDefault();
@@ -428,12 +494,68 @@
 			}
 		};
 
+		const handleImagePaste = async (blob: Blob, documentPath: string) => {
+			try {
+				// Convert Blob to ArrayBuffer
+				const arrayBuffer = await blob.arrayBuffer();
+				const uint8Array = Array.from(new Uint8Array(arrayBuffer));
+
+				// Determine extension from MIME type
+				const ext = blob.type.split('/')[1] || 'png';
+
+				// Generate filename with date + random string
+				const now = new Date();
+				const dateStr = now.toISOString().slice(0, 19).replace(/[-:T]/g, '').replace(/(\d{8})(\d{6})/, '$1_$2');
+				const randomStr = Math.random().toString(36).substring(2, 10);
+				const filename = `${dateStr}_${randomStr}.${ext}`;
+
+				// Call Tauri command
+				const relativePath = await invoke<string>('save_clipboard_image', {
+					documentPath,
+					imageData: uint8Array,
+					filename
+				});
+
+				// Use timestamp as alt text
+				const timestamp = new Date().toLocaleString('ko-KR', {
+					year: 'numeric', month: '2-digit', day: '2-digit',
+					hour: '2-digit', minute: '2-digit', second: '2-digit'
+				}).replace(/\. /g, '-').replace(/:/g, '-');
+
+				// URL-encode the path for markdown compatibility
+				// Keep path separators, encode only the filename
+				const pathParts = relativePath.split('/');
+				const filenameFromPath = pathParts.pop() || '';
+				const encodedPath = [...pathParts, encodeURIComponent(filenameFromPath)].join('/');
+
+				// Insert as Markdown syntax with URL-encoded path
+				const markdownText = `![image ${timestamp}](${encodedPath})`;
+				insertText(markdownText);
+
+			} catch (error) {
+				console.error('Failed to paste image:', error);
+				await message(String(error), {
+					title: 'Failed to paste image',
+					kind: 'error'
+				});
+			}
+		};
+
+		// Prevent browser's default dragover behavior
+		// NOTE: Don't prevent 'drop' event - Tauri needs it for file drop handling
+		const preventDefaultDragover = (e: DragEvent) => {
+			e.preventDefault();
+		};
+
 		container.addEventListener('wheel', wheelListener, { capture: true });
+		// Note: Paste is now handled by Monaco addCommand instead of container listener
+		container.addEventListener('dragover', preventDefaultDragover, true);
 
 		return () => {
 			// Clean up listeners
 			mediaQuery.removeEventListener('change', updateTheme);
 			container.removeEventListener('wheel', wheelListener, { capture: true });
+			container.removeEventListener('dragover', preventDefaultDragover, true);
 
 			if (editor && currentTabId) {
 				const state = editor.saveViewState();

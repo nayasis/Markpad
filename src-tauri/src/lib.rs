@@ -139,6 +139,153 @@ fn unwatch_file(state: State<'_, WatcherState>) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn copy_file_to_attachment(
+    source_path: String,
+    document_path: String,
+    target_filename: String,
+    is_image: bool
+) -> Result<String, String> {
+    use std::path::Path;
+
+    // Validate document path
+    let doc_path = Path::new(&document_path);
+    if !doc_path.exists() {
+        return Err("Document must be saved first".to_string());
+    }
+
+    // Determine .attachment directory path (images go to .attachment/images)
+    let doc_dir = doc_path.parent()
+        .ok_or("Invalid document path")?;
+    let subdir = if is_image { ".attachment/images" } else { ".attachment" };
+    let attach_dir = doc_dir.join(subdir);
+
+    // Check if .attachment folder is newly created
+    let attach_root = doc_dir.join(".attachment");
+    let is_new_folder = !attach_root.exists();
+
+    // Create directory
+    fs::create_dir_all(&attach_dir)
+        .map_err(|e| format!("Failed to create directory: {}", e))?;
+
+    // Set hidden attribute on .attachment folder on Windows (only when newly created)
+    #[cfg(target_os = "windows")]
+    if is_new_folder && attach_root.exists() {
+        use std::process::Command;
+        let _ = Command::new("attrib")
+            .args(&["+H", attach_root.to_str().unwrap_or("")])
+            .output();
+    }
+
+    // Handle filename conflicts (add counter)
+    let mut target_path = attach_dir.join(&target_filename);
+    let mut counter = 1;
+
+    if target_path.exists() {
+        let stem = Path::new(&target_filename).file_stem()
+            .and_then(|s| s.to_str()).unwrap_or("file");
+        let ext = Path::new(&target_filename).extension()
+            .and_then(|s| s.to_str()).unwrap_or("");
+
+        while target_path.exists() {
+            let new_name = if ext.is_empty() {
+                format!("{}_{}", stem, counter)
+            } else {
+                format!("{}_{}.{}", stem, counter, ext)
+            };
+            target_path = attach_dir.join(new_name);
+            counter += 1;
+        }
+    }
+
+    // Copy file
+    fs::copy(&source_path, &target_path)
+        .map_err(|e| format!("Failed to copy file: {}", e))?;
+
+    // Return relative path
+    let filename = target_path.file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("Invalid filename")?;
+    let relative_path = format!("{}/{}", subdir, filename);
+    Ok(relative_path)
+}
+
+#[tauri::command]
+fn save_clipboard_image(
+    document_path: String,
+    image_data: Vec<u8>,
+    filename: String
+) -> Result<String, String> {
+    use std::path::Path;
+
+    // Validate document path
+    let doc_path = Path::new(&document_path);
+    if !doc_path.exists() {
+        return Err("Document must be saved first".to_string());
+    }
+
+    // Create .attachment/images directory
+    let doc_dir = doc_path.parent()
+        .ok_or("Invalid document path")?;
+    let images_dir = doc_dir.join(".attachment/images");
+
+    // Check if .attachment folder is newly created
+    let attach_root = doc_dir.join(".attachment");
+    let is_new_folder = !attach_root.exists();
+
+    fs::create_dir_all(&images_dir)
+        .map_err(|e| format!("Failed to create directory: {}", e))?;
+
+    // Set hidden attribute on .attachment folder on Windows (only when newly created)
+    #[cfg(target_os = "windows")]
+    if is_new_folder && attach_root.exists() {
+        use std::process::Command;
+        let _ = Command::new("attrib")
+            .args(&["+H", attach_root.to_str().unwrap_or("")])
+            .output();
+    }
+
+    // Save with date+random string filename
+    let image_path = images_dir.join(&filename);
+
+    fs::write(&image_path, image_data)
+        .map_err(|e| format!("Failed to write image: {}", e))?;
+
+    // Return relative path
+    Ok(format!(".attachment/images/{}", filename))
+}
+
+#[tauri::command]
+fn open_file(path: String) -> Result<(), String> {
+    use std::process::Command;
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(&["/C", "start", "", &path])
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+
+    Ok(())
+}
+
 struct AppState {
     startup_file: Mutex<Option<String>>,
 }
@@ -458,6 +605,10 @@ pub fn run() {
             rename_file,
             watch_file,
             unwatch_file,
+
+            copy_file_to_attachment,
+            save_clipboard_image,
+            open_file,
 
             show_context_menu,
             show_window
