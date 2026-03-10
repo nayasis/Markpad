@@ -4,6 +4,7 @@
 	import { settings } from '../stores/settings.svelte.js';
 	import { invoke } from '@tauri-apps/api/core';
 	import { message } from '@tauri-apps/plugin-dialog';
+	import { encodeMarkdownPath } from '../attachment-path.js';
 
 	import * as monaco from 'monaco-editor';
 	import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
@@ -62,38 +63,6 @@
 	let wordCount = $state(0);
 	let currentLanguage = $state('markdown');
 	const currentTabId = tabManager.activeTabId;
-
-	function manualEncodeURIComponent(str: string): string {
-		const encoder = new TextEncoder();
-		const bytes = encoder.encode(str);
-		return Array.from(bytes)
-			.map(byte => '%' + byte.toString(16).toUpperCase().padStart(2, '0'))
-			.join('');
-	}
-
-	function encodePathSegment(segment: string): string {
-		return Array.from(segment)
-			.map(char => {
-				const code = char.charCodeAt(0);
-				if ((code >= 48 && code <= 57) ||
-					(code >= 65 && code <= 90) ||
-					(code >= 97 && code <= 122) ||
-					char === '.' ||
-					char === '-' ||
-					char === '_') {
-					return char;
-				}
-				return manualEncodeURIComponent(char);
-			})
-			.join('');
-	}
-
-	function encodeMarkdownPath(path: string): string {
-		return path
-			.split(/[/\\]/)
-			.map(encodePathSegment)
-			.join('/');
-	}
 
 	// Export method to insert text at cursor position
 	export function insertText(text: string) {

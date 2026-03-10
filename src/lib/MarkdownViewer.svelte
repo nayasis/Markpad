@@ -20,6 +20,7 @@
 	import HomePage from './components/HomePage.svelte';
 	import { tabManager } from './stores/tabs.svelte.js';
 	import { settings } from './stores/settings.svelte.js';
+	import { decodeMarkdownPath, encodeMarkdownPath } from './attachment-path.js';
 
 	// syntax highlighting & latex
 	let hljs: any = $state(null);
@@ -760,52 +761,6 @@
 		return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext || '');
 	}
 
-	// Manual UTF-8 percent encoding (encodeURIComponent is unreliable in Tauri)
-	function manualEncodeURIComponent(str: string): string {
-		const encoder = new TextEncoder();
-		const bytes = encoder.encode(str);
-		return Array.from(bytes)
-			.map(byte => '%' + byte.toString(16).toUpperCase().padStart(2, '0'))
-			.join('');
-	}
-
-	function encodePathSegment(segment: string): string {
-		return Array.from(segment)
-			.map(char => {
-				const code = char.charCodeAt(0);
-				if ((code >= 48 && code <= 57) ||
-					(code >= 65 && code <= 90) ||
-					(code >= 97 && code <= 122) ||
-					char === '.' ||
-					char === '-' ||
-					char === '_') {
-					return char;
-				}
-				return manualEncodeURIComponent(char);
-			})
-			.join('');
-	}
-
-	function encodeMarkdownPath(path: string): string {
-		return path
-			.split(/[/\\]/)
-			.map(encodePathSegment)
-			.join('/');
-	}
-
-	function decodeMarkdownPath(path: string): string {
-		return path
-			.split('/')
-			.map(segment => {
-				try {
-					return decodeURIComponent(segment);
-				} catch {
-					return segment;
-				}
-			})
-			.join('/');
-	}
-
 	function sanitizeFilename(filename: string): string {
 		const basename = filename.split(/[/\\]/).pop() || 'file';
 
@@ -1073,6 +1028,11 @@
 				}
 
 				if (tab.path && tab.path !== selected) {
+					await invoke('copy_attachments_for_save_as', {
+						sourceDocumentPath: tab.path,
+						targetDocumentPath: selected
+					});
+
 					contentToSave = await invoke<string>('prepare_save_as_content', {
 						sourceDocumentPath: tab.path,
 						targetDocumentPath: selected,
