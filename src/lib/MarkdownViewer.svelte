@@ -201,15 +201,8 @@
 			const src = img.getAttribute('src');
 			let finalSrc = src;
 			if (src && !src.startsWith('http') && !src.startsWith('data:')) {
-				let processedSrc = src;
-				if (!src.startsWith('.attachment/')) {
-					const pathParts = src.split('/');
-					const encodedFilename = pathParts.pop() || '';
-					const decodedFilename = decodeURIComponent(encodedFilename);
-					processedSrc = [...pathParts, decodedFilename].join('/');
-				}
-
-				finalSrc = convertFileSrc(resolvePath(filePath, processedSrc));
+				const decodedSrc = decodeMarkdownPath(src);
+				finalSrc = convertFileSrc(resolvePath(filePath, decodedSrc));
 				img.setAttribute('src', finalSrc);
 			}
 
@@ -509,14 +502,7 @@
 					return;
 				}
 
-				// Decode URL-encoded path before resolving
-				// Split path, decode filename part only
-				const pathParts = rawHref.split('/');
-				const encodedFilename = pathParts.pop() || '';
-				const decodedFilename = decodeURIComponent(encodedFilename);
-				const decodedHref = [...pathParts, decodedFilename].join('/');
-
-				const resolved = resolvePath(currentTab.path, decodedHref);
+				const resolved = resolvePath(currentTab.path, decodeMarkdownPath(rawHref));
 
 				try {
 					await invoke('open_file', { path: resolved });
@@ -783,43 +769,65 @@
 			.join('');
 	}
 
+	function encodePathSegment(segment: string): string {
+		return Array.from(segment)
+			.map(char => {
+				const code = char.charCodeAt(0);
+				if ((code >= 48 && code <= 57) ||
+					(code >= 65 && code <= 90) ||
+					(code >= 97 && code <= 122) ||
+					char === '.' ||
+					char === '-' ||
+					char === '_') {
+					return char;
+				}
+				return manualEncodeURIComponent(char);
+			})
+			.join('');
+	}
+
+	function encodeMarkdownPath(path: string): string {
+		return path
+			.split(/[/\\]/)
+			.map(encodePathSegment)
+			.join('/');
+	}
+
+	function decodeMarkdownPath(path: string): string {
+		return path
+			.split('/')
+			.map(segment => {
+				try {
+					return decodeURIComponent(segment);
+				} catch {
+					return segment;
+				}
+			})
+			.join('/');
+	}
+
 	function sanitizeFilename(filename: string): string {
 		const basename = filename.split(/[/\\]/).pop() || 'file';
 
-		// Separate filename and extension
 		const lastDotIndex = basename.lastIndexOf('.');
 		const name = lastDotIndex > 0 ? basename.slice(0, lastDotIndex) : basename;
 		const ext = lastDotIndex > 0 ? basename.slice(lastDotIndex) : '';
 
-		// Remove filesystem forbidden chars
-		const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '');
+		const cleanedName = name
+			.replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+			.replace(/[. ]+$/g, '')
+			.trim()
+			.substring(0, 200);
+		const cleanedExt = ext.replace(/[<>:"/\\|?*\x00-\x1F]/g, '');
 
-		// Encode ALL non-alphanumeric characters using manual UTF-8 encoding
-		// encodeURIComponent is unreliable in Tauri environment
-		const safeName = Array.from(cleaned)
-			.map(char => {
-				const code = char.charCodeAt(0);
-				// Keep only: a-z, A-Z, 0-9
-				if ((code >= 48 && code <= 57) ||   // 0-9
-					(code >= 65 && code <= 90) ||   // A-Z
-					(code >= 97 && code <= 122)) {  // a-z
-					return char;
-				}
-				// Manually encode everything else
-				return manualEncodeURIComponent(char);
-			})
-			.join('')
-			.substring(0, 200); // Allow longer names for encoded Unicode
-
-		// Use timestamp if filename is too short
-		if (safeName.length < 2) {
+		if (cleanedName.length < 1) {
 			const now = new Date();
 			const dateStr = now.toISOString().slice(0, 19).replace(/[-:T]/g, '').replace(/(\d{8})(\d{6})/, '$1_$2');
 			const randomStr = Math.random().toString(36).substring(2, 10);
-			return `${dateStr}_${randomStr}${ext}`;
+			return `${dateStr}_${randomStr}${cleanedExt}`;
 		}
 
-		return safeName + ext;
+		return cleanedName + cleanedExt;
 	}
 
 	async function handleEditorFileDrop(paths: string[]) {
@@ -846,18 +854,14 @@
 					targetFilename,
 					isImage
 				});
+				const markdownPath = encodeMarkdownPath(relativePath);
 
 				// Use original filename for alt text (remove extension)
-				// Now safe to use original name since filename is URL-encoded
 				const nameWithoutExt = originalFilename.replace(/\.[^/.]+$/, '');
 
-				// relativePath already contains URL-encoded filename from sanitizeFilename
-				// No need to encode again (would cause double encoding)
-
-				// Insert as Markdown syntax
 				const text = isImage
-					? `![${nameWithoutExt}](${relativePath})`
-					: `[${originalFilename}](${relativePath})`;
+					? `![${nameWithoutExt}](${markdownPath})`
+					: `[${originalFilename}](${markdownPath})`;
 
 				// Insert text into Editor component
 				editorComponent?.insertText(text);
@@ -1179,7 +1183,7 @@
 			if (isMarkdown && !rawHref.match(/^[a-z]+:\/\//i)) {
 				event.preventDefault();
 				const urlNoHash = rawHref.split('#')[0].split('?')[0];
-				const resolved = resolvePath(currentFile, urlNoHash);
+				const resolved = resolvePath(currentFile, decodeMarkdownPath(urlNoHash));
 				await loadMarkdown(resolved, { navigate: true });
 				return;
 			}
