@@ -479,7 +479,7 @@
 		});
 
 		// Handle attachment links
-		const attachmentLinks = markdownBody.querySelectorAll('a[href^=".attachment/"]');
+		const attachmentLinks = markdownBody.querySelectorAll('a[href^=".attachment_"]');
 		attachmentLinks.forEach((link) => {
 			const anchor = link as HTMLAnchorElement;
 			const rawHref = anchor.getAttribute('href');
@@ -1066,11 +1066,40 @@
 
 		if (selected) {
 			try {
-				await invoke('save_file_content', { path: selected, content: tab.rawContent });
+				let contentToSave = tab.rawContent;
+
+				if (!tab.isEditing && !tab.isSplit && tab.path) {
+					contentToSave = await invoke<string>('read_file_content', { path: tab.path });
+				}
+
+				if (tab.path && tab.path !== selected) {
+					contentToSave = await invoke<string>('prepare_save_as_content', {
+						sourceDocumentPath: tab.path,
+						targetDocumentPath: selected,
+						content: contentToSave
+					});
+				}
+
+				await invoke('save_file_content', { path: selected, content: contentToSave });
+				const html = (await invoke('render_markdown', { content: contentToSave })) as string;
+				const processedInfo = processMarkdownHtml(html, selected);
+
 				tabManager.updateTabPath(tab.id, selected);
+				tabManager.updateTabContent(tab.id, processedInfo);
 				saveRecentFile(selected);
 				tab.isDirty = false;
-				tab.originalContent = tab.rawContent;
+				tab.rawContent = contentToSave;
+				tab.originalContent = contentToSave;
+
+				try {
+					await invoke('cleanup_unused_attachments', {
+						documentPath: selected,
+						content: contentToSave
+					});
+				} catch (cleanupError) {
+					console.warn('Failed to cleanup attachments after save as:', cleanupError);
+				}
+
 				return true;
 			} catch (e) {
 				console.error('Failed to save file as', e);

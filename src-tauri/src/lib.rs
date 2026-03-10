@@ -3,7 +3,7 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::{Captures, Regex};
 use std::borrow::Cow;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -93,6 +93,63 @@ fn render_markdown(content: String) -> String {
     convert_markdown(&content)
 }
 
+fn sanitize_attachment_dir_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|ch| {
+            !matches!(*ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') && !ch.is_control()
+        })
+        .collect();
+
+    let trimmed = cleaned
+        .trim()
+        .trim_end_matches(|c| c == '.' || c == ' ')
+        .trim();
+
+    if trimmed.is_empty() {
+        "document".to_string()
+    } else {
+        trimmed.chars().take(100).collect()
+    }
+}
+
+fn attachment_root_name(doc_path: &Path) -> String {
+    let name = doc_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("document");
+    format!(".attachment_{}", sanitize_attachment_dir_name(name))
+}
+
+fn attachment_root_dir(doc_path: &Path) -> Result<PathBuf, String> {
+    let doc_dir = doc_path.parent().ok_or("Invalid document path")?;
+    Ok(doc_dir.join(attachment_root_name(doc_path)))
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
+    if !source.exists() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(destination)
+        .map_err(|e| format!("Failed to create directory: {}", e))?;
+
+    for entry in fs::read_dir(source).map_err(|e| format!("Failed to read directory: {}", e))? {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+
+        if source_path.is_dir() {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else {
+            fs::copy(&source_path, &destination_path)
+                .map_err(|e| format!("Failed to copy file: {}", e))?;
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 fn read_file_content(path: String) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| e.to_string())
@@ -101,6 +158,45 @@ fn read_file_content(path: String) -> Result<String, String> {
 #[tauri::command]
 fn save_file_content(path: String, content: String) -> Result<(), String> {
     fs::write(path, content).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn prepare_save_as_content(
+    source_document_path: String,
+    target_document_path: String,
+    content: String,
+) -> Result<String, String> {
+    let source_doc_path = Path::new(&source_document_path);
+    let target_doc_path = Path::new(&target_document_path);
+
+    let source_root_name = attachment_root_name(source_doc_path);
+    let target_root_name = attachment_root_name(target_doc_path);
+
+    let source_root_dir = attachment_root_dir(source_doc_path)?;
+    let target_root_dir = attachment_root_dir(target_doc_path)?;
+
+    if source_root_dir != target_root_dir && source_root_dir.exists() {
+        copy_dir_recursive(&source_root_dir, &target_root_dir)?;
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::process::Command;
+            let _ = Command::new("attrib")
+                .args(&["+H", target_root_dir.to_str().unwrap_or("")])
+                .output();
+        }
+    }
+
+    if source_root_name == target_root_name {
+        return Ok(content);
+    }
+
+    let encoded_source_root = urlencoding::encode(&source_root_name).into_owned();
+    let encoded_target_root = urlencoding::encode(&target_root_name).into_owned();
+
+    Ok(content
+        .replace(&format!("{}/", source_root_name), &format!("{}/", target_root_name))
+        .replace(&format!("{}/", encoded_source_root), &format!("{}/", encoded_target_root)))
 }
 
 #[tauri::command]
@@ -159,29 +255,32 @@ fn copy_file_to_attachment(
     target_filename: String,
     is_image: bool
 ) -> Result<String, String> {
-    use std::path::Path;
-
     // Validate document path
     let doc_path = Path::new(&document_path);
     if !doc_path.exists() {
         return Err("Document must be saved first".to_string());
     }
 
-    // Determine .attachment directory path (images go to .attachment/images)
-    let doc_dir = doc_path.parent()
-        .ok_or("Invalid document path")?;
-    let subdir = if is_image { ".attachment/images" } else { ".attachment" };
-    let attach_dir = doc_dir.join(subdir);
+    let attach_root_name = attachment_root_name(doc_path);
+    let attach_root = attachment_root_dir(doc_path)?;
+    let attach_dir = if is_image {
+        attach_root.join("images")
+    } else {
+        attach_root.clone()
+    };
+    let subdir = if is_image {
+        format!("{}/images", attach_root_name)
+    } else {
+        attach_root_name.clone()
+    };
 
-    // Check if .attachment folder is newly created
-    let attach_root = doc_dir.join(".attachment");
     let is_new_folder = !attach_root.exists();
 
     // Create directory
     fs::create_dir_all(&attach_dir)
         .map_err(|e| format!("Failed to create directory: {}", e))?;
 
-    // Set hidden attribute on .attachment folder on Windows (only when newly created)
+    // Set hidden attribute on the attachment folder on Windows (only when newly created)
     #[cfg(target_os = "windows")]
     if is_new_folder && attach_root.exists() {
         use std::process::Command;
@@ -229,27 +328,22 @@ fn save_clipboard_image(
     image_data: Vec<u8>,
     filename: String
 ) -> Result<String, String> {
-    use std::path::Path;
-
     // Validate document path
     let doc_path = Path::new(&document_path);
     if !doc_path.exists() {
         return Err("Document must be saved first".to_string());
     }
 
-    // Create .attachment/images directory
-    let doc_dir = doc_path.parent()
-        .ok_or("Invalid document path")?;
-    let images_dir = doc_dir.join(".attachment/images");
+    let attach_root_name = attachment_root_name(doc_path);
+    let attach_root = attachment_root_dir(doc_path)?;
+    let images_dir = attach_root.join("images");
 
-    // Check if .attachment folder is newly created
-    let attach_root = doc_dir.join(".attachment");
     let is_new_folder = !attach_root.exists();
 
     fs::create_dir_all(&images_dir)
         .map_err(|e| format!("Failed to create directory: {}", e))?;
 
-    // Set hidden attribute on .attachment folder on Windows (only when newly created)
+    // Set hidden attribute on the attachment folder on Windows (only when newly created)
     #[cfg(target_os = "windows")]
     if is_new_folder && attach_root.exists() {
         use std::process::Command;
@@ -265,7 +359,7 @@ fn save_clipboard_image(
         .map_err(|e| format!("Failed to write image: {}", e))?;
 
     // Return relative path
-    Ok(format!(".attachment/images/{}", filename))
+    Ok(format!("{}/images/{}", attach_root_name, filename))
 }
 
 #[tauri::command]
@@ -304,9 +398,6 @@ fn cleanup_unused_attachments(
     document_path: String,
     content: String
 ) -> Result<CleanupResult, String> {
-    use std::path::Path;
-    use std::collections::HashSet;
-
     // Validate document path
     let doc_path = Path::new(&document_path);
     if !doc_path.exists() {
@@ -319,9 +410,10 @@ fn cleanup_unused_attachments(
 
     let doc_dir = doc_path.parent()
         .ok_or("Invalid document path")?;
-    let attach_dir = doc_dir.join(".attachment");
+    let attach_root_name = attachment_root_name(doc_path);
+    let attach_dir = doc_dir.join(&attach_root_name);
 
-    // If .attachment directory doesn't exist, nothing to clean up
+    // If the current document's attachment directory doesn't exist, nothing to clean up
     if !attach_dir.exists() {
         return Ok(CleanupResult {
             deleted_count: 0,
@@ -330,70 +422,46 @@ fn cleanup_unused_attachments(
         });
     }
 
-    // Helper function to generate all possible path variations (URL-encoded/decoded)
-    fn add_path_variations(set: &mut HashSet<String>, path: &str) {
-        // Add original path
-        set.insert(path.to_string());
+    fn encode_markdown_path(path: &str) -> String {
+        path.split('/')
+            .map(|segment| urlencoding::encode(segment).into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
 
-        // Add fully decoded path
+    fn path_variations(path: &str) -> Vec<String> {
+        let mut variants = vec![path.to_string()];
+
+        let encoded = encode_markdown_path(path);
+        if encoded != path {
+            variants.push(encoded);
+        }
+
         if let Ok(decoded) = urlencoding::decode(path) {
-            let decoded_str = decoded.to_string();
-            if decoded_str != path {
-                set.insert(decoded_str);
+            let decoded = decoded.into_owned();
+            if !variants.contains(&decoded) {
+                variants.push(decoded);
             }
         }
 
-        // Add path with only filename decoded (keep directory path as-is)
-        if let Some(slash_pos) = path.rfind('/') {
-            let (dir, file) = path.split_at(slash_pos + 1);
-            if let Ok(decoded_file) = urlencoding::decode(file) {
-                let decoded_file_str = decoded_file.to_string();
-                if decoded_file_str != file {
-                    set.insert(format!("{}{}", dir, decoded_file_str));
-                }
-            }
-        }
-
-        // Add path with only directory decoded (keep filename as-is)
-        if let Some(slash_pos) = path.rfind('/') {
-            let (dir, file) = path.split_at(slash_pos + 1);
-            if let Ok(decoded_dir) = urlencoding::decode(dir) {
-                let decoded_dir_str = decoded_dir.to_string();
-                if decoded_dir_str != dir {
-                    set.insert(format!("{}{}", decoded_dir_str, file));
-                }
-            }
-        }
+        variants
     }
 
-    // Extract all attachment paths referenced in the document
-    let mut used_files = HashSet::new();
+    fn is_referenced_in_content(content: &str, path: &str) -> bool {
+        let markdown_link = format!("({})", path);
+        let obsidian_embed = format!("[[{}]]", path);
+        let obsidian_sized = format!("[[{}|", path);
 
-    // Pattern 1: Markdown links/images with .attachment paths
-    // Matches: ](.attachment/path/file.ext) - captures up to file extension, handles parentheses in filenames
-    let link_re = Regex::new(r"\]\((\.attachment/.*?\.(?:jpg|jpeg|png|gif|bmp|webp|svg|pdf|doc|docx|xls|xlsx|ppt|pptx|txt|md|zip|rar|7z|tar|gz|mp3|mp4|avi|mov))\)").unwrap();
-    for caps in link_re.captures_iter(&content) {
-        if let Some(path) = caps.get(1) {
-            let path_str = path.as_str().trim();
-            add_path_variations(&mut used_files, path_str);
-        }
+        content.contains(&markdown_link)
+            || content.contains(&obsidian_embed)
+            || content.contains(&obsidian_sized)
     }
 
-    // Pattern 2: Obsidian embeds ![[.attachment/path]] or ![[.attachment/path|size]]
-    // This pattern doesn't have the parenthesis problem
-    let obsidian_re = Regex::new(r"!\[\[(\.attachment/.*?\.(?:jpg|jpeg|png|gif|bmp|webp|svg|pdf|doc|docx|xls|xlsx|ppt|pptx|txt|md|zip|rar|7z|tar|gz|mp3|mp4|avi|mov))(?:\|[^\]]+)?\]\]").unwrap();
-    for caps in obsidian_re.captures_iter(&content) {
-        if let Some(path) = caps.get(1) {
-            let path_str = path.as_str().trim();
-            add_path_variations(&mut used_files, path_str);
-        }
-    }
-
-    // Walk through .attachment directory and find unused files
     let mut deleted_count = 0;
     let mut checked_files = Vec::new();
+    let mut used_files = Vec::new();
 
-    fn walk_dir(dir: &Path, base: &Path, used: &HashSet<String>, deleted: &mut usize, checked: &mut Vec<String>) -> Result<(), String> {
+    fn walk_dir(dir: &Path, base: &Path, content: &str, used: &mut Vec<String>, deleted: &mut usize, checked: &mut Vec<String>) -> Result<(), String> {
         if !dir.is_dir() {
             return Ok(());
         }
@@ -406,9 +474,8 @@ fn cleanup_unused_attachments(
             let path = entry.path();
 
             if path.is_dir() {
-                walk_dir(&path, base, used, deleted, checked)?;
+                walk_dir(&path, base, content, used, deleted, checked)?;
             } else if path.is_file() {
-                // Get relative path from document directory
                 let rel_path = path.strip_prefix(base)
                     .map_err(|e| format!("Failed to get relative path: {}", e))?;
                 let rel_path_str = rel_path.to_string_lossy()
@@ -416,14 +483,16 @@ fn cleanup_unused_attachments(
 
                 checked.push(rel_path_str.clone());
 
-                // Check if this file is used in the document
-                if !used.contains(&rel_path_str) {
-                    // Delete unused file
-                    if let Err(_e) = fs::remove_file(&path) {
-                        // Ignore deletion errors
-                    } else {
-                        *deleted += 1;
-                    }
+                let is_used = path_variations(&rel_path_str)
+                    .iter()
+                    .any(|variant| is_referenced_in_content(content, variant));
+
+                if is_used {
+                    used.push(rel_path_str);
+                } else if let Err(_e) = fs::remove_file(&path) {
+                    // Ignore deletion errors
+                } else {
+                    *deleted += 1;
                 }
             }
         }
@@ -431,7 +500,7 @@ fn cleanup_unused_attachments(
         Ok(())
     }
 
-    walk_dir(&attach_dir, doc_dir, &used_files, &mut deleted_count, &mut checked_files)?;
+    walk_dir(&attach_dir, doc_dir, &content, &mut used_files, &mut deleted_count, &mut checked_files)?;
 
     // Clean up empty directories
     fn remove_empty_dirs(dir: &Path) -> Result<(), String> {
@@ -470,7 +539,7 @@ fn cleanup_unused_attachments(
 
     Ok(CleanupResult {
         deleted_count,
-        used_files: used_files.into_iter().collect(),
+        used_files,
         checked_files,
     })
 }
@@ -746,6 +815,7 @@ pub fn run() {
             send_markdown_path,
             read_file_content,
             save_file_content,
+            prepare_save_as_content,
             get_app_mode,
             setup::install_app,
             setup::uninstall_app,

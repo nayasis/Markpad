@@ -63,6 +63,38 @@
 	let currentLanguage = $state('markdown');
 	const currentTabId = tabManager.activeTabId;
 
+	function manualEncodeURIComponent(str: string): string {
+		const encoder = new TextEncoder();
+		const bytes = encoder.encode(str);
+		return Array.from(bytes)
+			.map(byte => '%' + byte.toString(16).toUpperCase().padStart(2, '0'))
+			.join('');
+	}
+
+	function encodePathSegment(segment: string): string {
+		return Array.from(segment)
+			.map(char => {
+				const code = char.charCodeAt(0);
+				if ((code >= 48 && code <= 57) ||
+					(code >= 65 && code <= 90) ||
+					(code >= 97 && code <= 122) ||
+					char === '.' ||
+					char === '-' ||
+					char === '_') {
+					return char;
+				}
+				return manualEncodeURIComponent(char);
+			})
+			.join('');
+	}
+
+	function encodeMarkdownPath(path: string): string {
+		return path
+			.split(/[/\\]/)
+			.map(encodePathSegment)
+			.join('/');
+	}
+
 	// Export method to insert text at cursor position
 	export function insertText(text: string) {
 		if (!editor) return;
@@ -554,9 +586,10 @@
 					imageData: uint8Array,
 					filename
 				});
+				const markdownPath = encodeMarkdownPath(relativePath);
 
 				// Insert as Obsidian embed syntax
-				const markdownText = `![[${relativePath}]]`;
+				const markdownText = `![[${markdownPath}]]`;
 				insertText(markdownText);
 
 			} catch (error) {
