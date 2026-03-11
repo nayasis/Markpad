@@ -31,12 +31,18 @@
 
 	let mode = $state<'loading' | 'app' | 'installer' | 'uninstall'>('loading');
 
+	type EditorHandle = {
+		insertText: (text: string) => void;
+		focus: () => void;
+		syncScrollToLine: (line: number, ratio?: number) => void;
+	};
+
 	let showSettings = $state(false);
 
 	let recentFiles = $state<string[]>([]);
 	let isFocused = $state(true);
 	let markdownBody = $state<HTMLElement | null>(null);
-	let editorPane = $state<{ syncScrollToLine: (line: number, ratio?: number) => void } | null>(null);
+	let editorPane = $state<Pick<EditorHandle, 'syncScrollToLine'> | null>(null);
 	let liveMode = $state(false);
 
 	let isDragging = $state(false);
@@ -60,6 +66,11 @@
 
 	let showHome = $state(false);
 	let isFullWidth = $state(localStorage.getItem('isFullWidth') === 'true');
+	let editorComponent = $state<EditorHandle | null>(null);
+
+	$effect(() => {
+		editorPane = editorComponent;
+	});
 
 	$effect(() => {
 		localStorage.setItem('isFullWidth', String(isFullWidth));
@@ -190,7 +201,15 @@
 			const src = img.getAttribute('src');
 			let finalSrc = src;
 			if (src && !src.startsWith('http') && !src.startsWith('data:')) {
-				finalSrc = convertFileSrc(resolvePath(filePath, src));
+				let processedSrc = src;
+				if (!src.startsWith('.attachment/')) {
+					const pathParts = src.split('/');
+					const encodedFilename = pathParts.pop() || '';
+					const decodedFilename = decodeURIComponent(encodedFilename);
+					processedSrc = [...pathParts, decodedFilename].join('/');
+				}
+
+				finalSrc = convertFileSrc(resolvePath(filePath, processedSrc));
 				img.setAttribute('src', finalSrc);
 			}
 
@@ -434,6 +453,85 @@
 			],
 			throwOnError: false,
 		});
+
+		// Handle Obsidian-style image sizing in alt text
+		// Supports: ![alt|width](path) or ![alt|widthxheight](path)
+		const images = markdownBody.querySelectorAll('img');
+		images.forEach((img) => {
+			const alt = img.getAttribute('alt');
+			if (!alt) return;
+
+			// Check if alt contains size parameter (e.g., "image|400" or "image|400x300")
+			const pipeIndex = alt.lastIndexOf('|');
+			if (pipeIndex === -1) return;
+
+			const actualAlt = alt.substring(0, pipeIndex);
+			const sizeParam = alt.substring(pipeIndex + 1).trim();
+
+			if (!sizeParam) return;
+
+			// Parse size parameter
+			if (sizeParam.includes('x')) {
+				// Format: widthxheight (e.g., "400x300")
+				const [width, height] = sizeParam.split('x');
+				if (width) img.setAttribute('width', width);
+				if (height) img.setAttribute('height', height);
+			} else {
+				// Format: width only (e.g., "400")
+				img.setAttribute('width', sizeParam);
+			}
+
+			// Update alt text to remove size parameter
+			img.setAttribute('alt', actualAlt);
+		});
+
+		// Handle attachment links
+		const attachmentLinks = markdownBody.querySelectorAll('a[href^=".attachment/"]');
+		attachmentLinks.forEach((link) => {
+			const anchor = link as HTMLAnchorElement;
+			const rawHref = anchor.getAttribute('href');
+			if (!rawHref) return;
+
+			// Remove existing listener if any
+			const oldListener = (anchor as any)._attachmentClickHandler;
+			if (oldListener) {
+				anchor.removeEventListener('click', oldListener);
+			}
+
+			// Add new listener
+			const handler = async (e: MouseEvent) => {
+				e.preventDefault();
+				e.stopPropagation();
+
+				const currentTab = tabManager.activeTab;
+				if (!currentTab?.path) {
+					console.error('Cannot open attachment: no current document path');
+					return;
+				}
+
+				// Decode URL-encoded path before resolving
+				// Split path, decode filename part only
+				const pathParts = rawHref.split('/');
+				const encodedFilename = pathParts.pop() || '';
+				const decodedFilename = decodeURIComponent(encodedFilename);
+				const decodedHref = [...pathParts, decodedFilename].join('/');
+
+				const resolved = resolvePath(currentTab.path, decodedHref);
+
+				try {
+					await invoke('open_file', { path: resolved });
+				} catch (error) {
+					console.error('Failed to open attachment:', error);
+					await askCustom(
+						`Failed to open file: ${error}`,
+						{ title: 'Error', kind: 'error' }
+					);
+				}
+			};
+
+			anchor.addEventListener('click', handler);
+			(anchor as any)._attachmentClickHandler = handler;
+		});
 	}
 
 	$effect(() => {
@@ -671,6 +769,139 @@
 		return parts.join('/');
 	}
 
+	function isImageFile(filename: string): boolean {
+		const ext = filename.split('.').pop()?.toLowerCase();
+		return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext || '');
+	}
+
+	// Manual UTF-8 percent encoding (encodeURIComponent is unreliable in Tauri)
+	function manualEncodeURIComponent(str: string): string {
+		const encoder = new TextEncoder();
+		const bytes = encoder.encode(str);
+		return Array.from(bytes)
+			.map(byte => '%' + byte.toString(16).toUpperCase().padStart(2, '0'))
+			.join('');
+	}
+
+	function sanitizeFilename(filename: string): string {
+		const basename = filename.split(/[/\\]/).pop() || 'file';
+
+		// Separate filename and extension
+		const lastDotIndex = basename.lastIndexOf('.');
+		const name = lastDotIndex > 0 ? basename.slice(0, lastDotIndex) : basename;
+		const ext = lastDotIndex > 0 ? basename.slice(lastDotIndex) : '';
+
+		// Remove filesystem forbidden chars
+		const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '');
+
+		// Encode ALL non-alphanumeric characters using manual UTF-8 encoding
+		// encodeURIComponent is unreliable in Tauri environment
+		const safeName = Array.from(cleaned)
+			.map(char => {
+				const code = char.charCodeAt(0);
+				// Keep only: a-z, A-Z, 0-9
+				if ((code >= 48 && code <= 57) ||   // 0-9
+					(code >= 65 && code <= 90) ||   // A-Z
+					(code >= 97 && code <= 122)) {  // a-z
+					return char;
+				}
+				// Manually encode everything else
+				return manualEncodeURIComponent(char);
+			})
+			.join('')
+			.substring(0, 200); // Allow longer names for encoded Unicode
+
+		// Use timestamp if filename is too short
+		if (safeName.length < 2) {
+			const now = new Date();
+			const dateStr = now.toISOString().slice(0, 19).replace(/[-:T]/g, '').replace(/(\d{8})(\d{6})/, '$1_$2');
+			const randomStr = Math.random().toString(36).substring(2, 10);
+			return `${dateStr}_${randomStr}${ext}`;
+		}
+
+		return safeName + ext;
+	}
+
+	async function handleEditorFileDrop(paths: string[]) {
+		const currentTab = tabManager.activeTab;
+		if (!currentTab?.path) {
+			await askCustom(
+				'Please save the document first before dropping files.',
+				{ title: 'Save Required', kind: 'warning' }
+			);
+			return;
+		}
+
+		let insertedCount = 0;
+
+		for (const sourcePath of paths) {
+			try {
+				const originalFilename = sourcePath.split(/[/\\]/).pop() || 'file';
+				const isImage = isImageFile(originalFilename);
+				const targetFilename = sanitizeFilename(originalFilename);
+
+				const relativePath = await invoke<string>('copy_file_to_attachment', {
+					sourcePath,
+					documentPath: currentTab.path,
+					targetFilename,
+					isImage
+				});
+
+				// Use original filename for alt text (remove extension)
+				// Now safe to use original name since filename is URL-encoded
+				const nameWithoutExt = originalFilename.replace(/\.[^/.]+$/, '');
+
+				// relativePath already contains URL-encoded filename from sanitizeFilename
+				// No need to encode again (would cause double encoding)
+
+				// Insert as Markdown syntax
+				const text = isImage
+					? `![${nameWithoutExt}](${relativePath})`
+					: `[${originalFilename}](${relativePath})`;
+
+				// Insert text into Editor component
+				editorComponent?.insertText(text);
+				insertedCount++;
+
+			} catch (error) {
+				console.error('Failed to copy file:', error);
+				await askCustom(
+					`Failed to add file: ${error}`,
+					{ title: 'Error', kind: 'error' }
+				);
+			}
+		}
+
+		// Focus window and editor after all files are processed
+		if (insertedCount > 0) {
+			await tick(); // Wait for DOM updates
+
+			// Focus Tauri window at OS level - try multiple times with delay
+			try {
+				const appWindow = getCurrentWindow();
+
+				// First attempt - immediate
+				await appWindow.setFocus();
+
+				// Second attempt - with delay to overcome drag event focus steal
+				setTimeout(async () => {
+					try {
+						await appWindow.setFocus();
+						editorComponent?.focus();
+					} catch (e) {
+						console.error('Failed delayed window focus:', e);
+					}
+				}, 100);
+
+			} catch (error) {
+				console.error('Failed to focus window:', error);
+			}
+
+			// Focus Monaco editor immediately
+			editorComponent?.focus();
+		}
+	}
+
 	function isYoutubeLink(url: string) {
 		return url.includes('youtube.com/watch') || url.includes('youtu.be/');
 	}
@@ -799,6 +1030,17 @@
 			}
 			tab.isDirty = false;
 			tab.originalContent = tab.rawContent;
+
+			// Clean up unused attachment files
+			try {
+				await invoke('cleanup_unused_attachments', {
+					documentPath: targetPath,
+					content: tab.rawContent
+				});
+			} catch (cleanupError) {
+				// Don't fail the save operation if cleanup fails
+				console.warn('Failed to cleanup attachments:', cleanupError);
+			}
 			return true;
 		} catch (e) {
 			console.error('Failed to save file', e);
@@ -1196,7 +1438,6 @@
 		invoke('show_window').catch(console.error);
 
 		const init = async () => {
-			const { getCurrentWindow } = await import('@tauri-apps/api/window');
 			const appWindow = getCurrentWindow();
 			const appMode = (await invoke('get_app_mode')) as any;
 
@@ -1334,16 +1575,22 @@
 
 			unlisteners.push(
 				await appWindow.onDragDropEvent((event) => {
-					if (isEditing) {
-						isDragging = false;
-						return;
-					}
-
 					if (event.payload.type === 'enter' || event.payload.type === 'over') {
 						isDragging = true;
 					} else if (event.payload.type === 'drop') {
 						isDragging = false;
-						event.payload.paths.forEach((path) => loadMarkdown(path));
+
+						const currentTab = tabManager.activeTab;
+						// Editor is visible in both full edit mode (isEditing) and split view mode (isSplit)
+						const shouldAttachFile = currentTab && (currentTab.isEditing || currentTab.isSplit);
+
+						if (shouldAttachFile) {
+							// Editor mode or Split view: attach files
+							handleEditorFileDrop(event.payload.paths);
+						} else {
+							// Viewer mode: open files (default behavior)
+							event.payload.paths.forEach((path) => loadMarkdown(path));
+						}
 					} else {
 						isDragging = false;
 					}
@@ -1476,7 +1723,7 @@
 					<div class="pane editor-pane" class:active={isEditing || isSplit} style="flex: {isSplit ? tabManager.activeTab.splitRatio : isEditing ? 1 : 0}">
 						{#if isEditing || isSplit}
 							<Editor
-								bind:this={editorPane}
+								bind:this={editorComponent}
 								bind:value={tabManager.activeTab.rawContent}
 								language={editorLanguage}
 								{theme}
@@ -1538,7 +1785,7 @@
 		onsave={handleModalSave}
 		oncancel={handleModalCancel} />
 
-	{#if isDragging && !isEditing}
+	{#if isDragging && !isEditing && !isSplit}
 		<div class="drag-overlay" role="presentation">
 			<div class="drag-message">
 				<svg
