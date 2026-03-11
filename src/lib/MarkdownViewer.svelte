@@ -448,37 +448,6 @@
 			throwOnError: false,
 		});
 
-		// Handle Obsidian-style image sizing in alt text
-		// Supports: ![alt|width](path) or ![alt|widthxheight](path)
-		const images = markdownBody.querySelectorAll('img');
-		images.forEach((img) => {
-			const alt = img.getAttribute('alt');
-			if (!alt) return;
-
-			// Check if alt contains size parameter (e.g., "image|400" or "image|400x300")
-			const pipeIndex = alt.lastIndexOf('|');
-			if (pipeIndex === -1) return;
-
-			const actualAlt = alt.substring(0, pipeIndex);
-			const sizeParam = alt.substring(pipeIndex + 1).trim();
-
-			if (!sizeParam) return;
-
-			// Parse size parameter
-			if (sizeParam.includes('x')) {
-				// Format: widthxheight (e.g., "400x300")
-				const [width, height] = sizeParam.split('x');
-				if (width) img.setAttribute('width', width);
-				if (height) img.setAttribute('height', height);
-			} else {
-				// Format: width only (e.g., "400")
-				img.setAttribute('width', sizeParam);
-			}
-
-			// Update alt text to remove size parameter
-			img.setAttribute('alt', actualAlt);
-		});
-
 		// Handle attachment links
 		const attachmentLinks = markdownBody.querySelectorAll('a[href^=".attachment_"]');
 		attachmentLinks.forEach((link) => {

@@ -26,35 +26,129 @@ async fn show_window(window: tauri::Window) {
     window.show().unwrap();
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImageSizeSpec<'a> {
+    width: Option<&'a str>,
+    height: Option<&'a str>,
+}
+
+fn escape_html_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn parse_image_size_spec(value: &str) -> Option<ImageSizeSpec<'_>> {
+    fn parse_dimension(dimension: &str) -> Option<Option<&str>> {
+        let dimension = dimension.trim();
+        if dimension.is_empty() {
+            Some(None)
+        } else if dimension.chars().all(|ch| ch.is_ascii_digit()) {
+            Some(Some(dimension))
+        } else {
+            None
+        }
+    }
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((width, height)) = trimmed.split_once('x') {
+        let width = parse_dimension(width)?;
+        let height = parse_dimension(height)?;
+
+        if width.is_none() && height.is_none() {
+            None
+        } else {
+            Some(ImageSizeSpec { width, height })
+        }
+    } else {
+        let width = parse_dimension(trimmed)?;
+        width.map(|width| ImageSizeSpec {
+            width: Some(width),
+            height: None,
+        })
+    }
+}
+
+fn build_image_tag(path: &str, alt: &str, size: Option<ImageSizeSpec<'_>>) -> String {
+    let mut attributes = vec![format!(r#"src="{}""#, escape_html_attr(&path.replace(' ', "%20")))];
+
+    if let Some(size) = size {
+        if let Some(width) = size.width {
+            attributes.push(format!(r#"width="{}""#, width));
+        }
+
+        if let Some(height) = size.height {
+            attributes.push(format!(r#"height="{}""#, height));
+        }
+    }
+
+    attributes.push(format!(r#"alt="{}""#, escape_html_attr(alt)));
+
+    format!("<img {} />", attributes.join(" "))
+}
+
 fn process_obsidian_embeds(content: &str) -> Cow<'_, str> {
     let re = Regex::new(r"!\[\[(.*?)\]\]").unwrap();
 
     re.replace_all(content, |caps: &Captures| {
         let inner = &caps[1];
-        let mut parts = inner.split('|');
-        let path = parts.next().unwrap_or("");
-        let size = parts.next();
+        let mut parts = inner.splitn(2, '|');
+        let path = parts.next().unwrap_or("").trim();
+        let size = parts.next().and_then(parse_image_size_spec);
 
-        let path_escaped = path.replace(" ", "%20");
+        build_image_tag(path, path, size)
+    })
+}
 
-        if let Some(size_str) = size {
-            if size_str.contains('x') {
-                let mut dims = size_str.split('x');
-                let width = dims.next().unwrap_or("");
-                let height = dims.next().unwrap_or("");
-                format!(
-                    "<img src=\"{}\" width=\"{}\" height=\"{}\" alt=\"{}\" />",
-                    path_escaped, width, height, path
-                )
-            } else {
-                format!(
-                    "<img src=\"{}\" width=\"{}\" alt=\"{}\" />",
-                    path_escaped, size_str, path
-                )
-            }
-        } else {
-            format!("<img src=\"{}\" alt=\"{}\" />", path_escaped, path)
+fn process_markdown_image_sizes(html: &str) -> Cow<'_, str> {
+    let image_re = Regex::new(r#"<img(?P<attrs>[^>]*?)(?:\s*/)?>"#).unwrap();
+    let alt_re = Regex::new(r#"\salt="(?P<alt>[^"]*)""#).unwrap();
+
+    image_re.replace_all(html, |caps: &Captures| {
+        let full = caps.get(0).unwrap().as_str();
+        let attrs = caps.name("attrs").unwrap().as_str();
+        let attrs = attrs.trim_end();
+
+        if attrs.contains(r#" width=""#) || attrs.contains(r#" height=""#) {
+            return full.to_string();
         }
+
+        let Some(alt_caps) = alt_re.captures(attrs) else {
+            return full.to_string();
+        };
+
+        let alt = alt_caps.name("alt").unwrap().as_str();
+        let Some(pipe_index) = alt.rfind('|') else {
+            return full.to_string();
+        };
+
+        let actual_alt = &alt[..pipe_index];
+        let size = &alt[pipe_index + 1..];
+        let Some(size) = parse_image_size_spec(size) else {
+            return full.to_string();
+        };
+
+        let mut new_attrs = attrs.replacen(
+            alt_caps.get(0).unwrap().as_str(),
+            &format!(r#" alt="{}""#, actual_alt),
+            1,
+        );
+
+        if let Some(width) = size.width {
+            new_attrs.push_str(&format!(r#" width="{}""#, width));
+        }
+
+        if let Some(height) = size.height {
+            new_attrs.push_str(&format!(r#" height="{}""#, height));
+        }
+
+        format!("<img{} />", new_attrs)
     })
 }
 
@@ -79,7 +173,8 @@ fn convert_markdown(content: &str) -> String {
     options.render.hardbreaks = true;
     options.render.sourcepos = true;
 
-    markdown_to_html(&processed, &options)
+    let html = markdown_to_html(&processed, &options);
+    process_markdown_image_sizes(&html).into_owned()
 }
 
 #[tauri::command]
@@ -91,6 +186,59 @@ fn open_markdown(path: String) -> Result<String, String> {
 #[tauri::command]
 fn render_markdown(content: String) -> String {
     convert_markdown(&content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::convert_markdown;
+
+    #[test]
+    fn renders_obsidian_embed_with_width() {
+        let html = convert_markdown("![[image.png|300]]");
+
+        assert!(html.contains(r#"<img src="image.png" width="300" alt="image.png" />"#));
+    }
+
+    #[test]
+    fn renders_markdown_image_with_width_from_alt() {
+        let html = convert_markdown("![preview|300](image.png)");
+
+        assert!(html.contains(r#"src="image.png""#));
+        assert!(html.contains(r#"alt="preview""#));
+        assert!(html.contains(r#"width="300""#));
+        assert!(!html.contains(r#"alt="preview|300""#));
+    }
+
+    #[test]
+    fn renders_markdown_image_with_width_and_height_from_alt() {
+        let html = convert_markdown("![preview|300x200](image.png)");
+
+        assert!(html.contains(r#"src="image.png""#));
+        assert!(html.contains(r#"alt="preview""#));
+        assert!(html.contains(r#"width="300""#));
+        assert!(html.contains(r#"height="200""#));
+        assert!(!html.contains(r#"alt="preview|300x200""#));
+    }
+
+    #[test]
+    fn keeps_non_numeric_markdown_alt_suffixes_untouched() {
+        let html = convert_markdown("![preview|full](image.png)");
+
+        assert!(html.contains(r#"src="image.png""#));
+        assert!(html.contains(r#"alt="preview|full""#));
+        assert!(!html.contains(r#"width=""#));
+        assert!(!html.contains(r#"height=""#));
+    }
+
+    #[test]
+    fn uses_last_pipe_when_parsing_markdown_alt_sizes() {
+        let html = convert_markdown("![foo|bar|320](image.png)");
+
+        assert!(html.contains(r#"src="image.png""#));
+        assert!(html.contains(r#"alt="foo|bar""#));
+        assert!(html.contains(r#"width="320""#));
+        assert!(!html.contains(r#"alt="foo|bar|320""#));
+    }
 }
 
 fn sanitize_attachment_dir_name(name: &str) -> String {
