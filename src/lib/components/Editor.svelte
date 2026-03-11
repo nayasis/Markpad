@@ -4,6 +4,7 @@
 	import { settings } from '../stores/settings.svelte.js';
 	import { invoke } from '@tauri-apps/api/core';
 	import { message } from '@tauri-apps/plugin-dialog';
+	import { hasFiles, hasImage, hasText, readFiles, readImageBinary, readText as readClipboardText } from 'tauri-plugin-clipboard-api';
 	import { encodeMarkdownPath } from '../attachment-path.js';
 
 	import * as monaco from 'monaco-editor';
@@ -85,6 +86,49 @@
 		if (editor) {
 			editor.focus();
 		}
+	}
+
+	function isImageFile(filename: string): boolean {
+		const ext = filename.split('.').pop()?.toLowerCase();
+		return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext || '');
+	}
+
+	function sanitizeFilename(filename: string): string {
+		const basename = filename.split(/[/\\]/).pop() || 'file';
+
+		const lastDotIndex = basename.lastIndexOf('.');
+		const name = lastDotIndex > 0 ? basename.slice(0, lastDotIndex) : basename;
+		const ext = lastDotIndex > 0 ? basename.slice(lastDotIndex) : '';
+
+		const cleanedName = name
+			.replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+			.replace(/[. ]+$/g, '')
+			.trim()
+			.substring(0, 200);
+		const cleanedExt = ext.replace(/[<>:"/\\|?*\x00-\x1F]/g, '');
+
+		if (cleanedName.length < 1) {
+			return `pasted_${Date.now()}${cleanedExt}`;
+		}
+
+		return cleanedName + cleanedExt;
+	}
+
+	function generateClipboardFilename(type: string, fallback = 'png'): string {
+		const ext = type.split('/')[1] || fallback;
+		const now = new Date();
+		const dateStr = now.toISOString().slice(0, 19).replace(/[-:T]/g, '').replace(/(\d{8})(\d{6})/, '$1_$2');
+		const randomStr = Math.random().toString(36).substring(2, 10);
+		return `${dateStr}_${randomStr}.${ext}`;
+	}
+
+	function toAttachmentMarkdown(relativePath: string, filename: string, isImage: boolean): string {
+		const markdownPath = encodeMarkdownPath(relativePath);
+		if (isImage) {
+			const altText = filename.replace(/\.[^/.]+$/, '') || 'image';
+			return `![${altText}](${markdownPath})`;
+		}
+		return `[${filename}](${markdownPath})`;
 	}
 
 	self.MonacoEnvironment = {
@@ -481,45 +525,82 @@
 			},
 		});
 
-		// Custom paste handler for images (Ctrl+V / Cmd+V)
-		editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, async () => {
-			const currentTab = tabManager.activeTab;
-
+		const handleNativeClipboardPaste = async () => {
 			try {
-				// Read clipboard using ClipboardItem API
-				const clipboardItems = await navigator.clipboard.read();
+				const documentPath = tabManager.activeTab?.path;
 
-				// Check for images first (only for saved documents)
-				if (currentTab?.path) {
-					for (const item of clipboardItems) {
-						// Check if clipboard contains image
-						const imageType = item.types.find(type => type.startsWith('image/'));
-						if (imageType) {
-							const blob = await item.getType(imageType);
-							await handleImagePaste(blob, currentTab.path);
-							return; // Image handled, done
-						}
+				if (await hasFiles()) {
+					if (!documentPath) {
+						await message('Please save the document first before pasting files.', {
+							title: 'Cannot paste files',
+							kind: 'warning'
+						});
+						return;
+					}
+
+					const sourcePaths = await readFiles();
+					const markdownParts: string[] = [];
+
+					for (const sourcePath of sourcePaths) {
+						const originalFilename = sourcePath.split(/[/\\]/).pop() || 'file';
+						const filename = sanitizeFilename(originalFilename);
+						const isImage = isImageFile(filename);
+						const relativePath = await invoke<string>('copy_file_to_attachment', {
+							sourcePath,
+							documentPath,
+							targetFilename: filename,
+							isImage
+						});
+
+						markdownParts.push(toAttachmentMarkdown(relativePath, filename, isImage));
+					}
+
+					if (markdownParts.length > 0) {
+						insertText(markdownParts.join('\n'));
+						return;
 					}
 				}
 
-				// No image found or unsaved document - paste text manually
-				const text = await navigator.clipboard.readText();
-				if (text) {
-					insertText(text);
+				if (await hasImage()) {
+					if (!documentPath) {
+						await message('Please save the document first before pasting images.', {
+							title: 'Cannot paste image',
+							kind: 'warning'
+						});
+						return;
+					}
+
+					const imageData = await readImageBinary('int_array') as number[];
+					const filename = generateClipboardFilename('image/png', 'png');
+					const relativePath = await invoke<string>('save_clipboard_file', {
+						documentPath,
+						fileData: imageData,
+						filename,
+						isImage: true
+					});
+
+					insertText(toAttachmentMarkdown(relativePath, filename, true));
+					return;
 				}
 
-			} catch (error) {
-				console.error('Clipboard read error:', error);
-				// Try text paste as fallback
-				try {
-					const text = await navigator.clipboard.readText();
+				if (await hasText()) {
+					const text = await readClipboardText();
 					if (text) {
 						insertText(text);
+						return;
 					}
-				} catch (e) {
-					console.error('Text paste failed:', e);
 				}
+			} catch (error) {
+				console.error('Native clipboard paste failed:', error);
 			}
+		};
+
+		editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, () => {
+			void handleNativeClipboardPaste();
+		});
+
+		editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.Insert, () => {
+			void handleNativeClipboardPaste();
 		});
 
 		const wheelListener = (e: WheelEvent) => {
@@ -534,40 +615,65 @@
 			}
 		};
 
-		const handleImagePaste = async (blob: Blob, documentPath: string) => {
+		const saveClipboardAttachment = async (file: Blob, documentPath: string, filename: string, isImage: boolean) => {
 			try {
-				// Convert Blob to ArrayBuffer
-				const arrayBuffer = await blob.arrayBuffer();
+				const arrayBuffer = await file.arrayBuffer();
 				const uint8Array = Array.from(new Uint8Array(arrayBuffer));
-
-				// Determine extension from MIME type
-				const ext = blob.type.split('/')[1] || 'png';
-
-				// Generate filename with date + random string
-				const now = new Date();
-				const dateStr = now.toISOString().slice(0, 19).replace(/[-:T]/g, '').replace(/(\d{8})(\d{6})/, '$1_$2');
-				const randomStr = Math.random().toString(36).substring(2, 10);
-				const filename = `${dateStr}_${randomStr}.${ext}`;
-
-				// Call Tauri command
-				const relativePath = await invoke<string>('save_clipboard_image', {
+				return await invoke<string>('save_clipboard_file', {
 					documentPath,
-					imageData: uint8Array,
-					filename
+					fileData: uint8Array,
+					filename,
+					isImage
 				});
-				const markdownPath = encodeMarkdownPath(relativePath);
-
-				// Insert as Obsidian embed syntax
-				const markdownText = `![[${markdownPath}]]`;
-				insertText(markdownText);
-
 			} catch (error) {
-				console.error('Failed to paste image:', error);
+				console.error('Failed to save clipboard attachment:', error);
 				await message(String(error), {
-					title: 'Failed to paste image',
+					title: 'Failed to paste attachment',
 					kind: 'error'
 				});
+				return null;
 			}
+		};
+
+		const handleClipboardFilesPaste = async (pasteEvent: monaco.editor.IPasteEvent) => {
+			const clipboardData = pasteEvent.clipboardEvent?.clipboardData;
+			if (!clipboardData) return;
+
+			const fileItems = Array.from(clipboardData.items).filter((item) => item.kind === 'file');
+			if (fileItems.length === 0) return;
+
+			const currentTab = tabManager.activeTab;
+			if (!currentTab?.path) {
+				await message('Please save the document first before pasting files.', {
+					title: 'Cannot paste files',
+					kind: 'warning'
+				});
+				return;
+			}
+
+			const markdownParts: string[] = [];
+			for (const item of fileItems) {
+				const file = item.getAsFile();
+				if (!file) continue;
+
+				const filename = file.name
+					? sanitizeFilename(file.name)
+					: generateClipboardFilename(file.type, 'bin');
+				const isImage = isImageFile(filename) || file.type.startsWith('image/');
+				const relativePath = await saveClipboardAttachment(file, currentTab.path, filename, isImage);
+				if (relativePath) {
+					markdownParts.push(toAttachmentMarkdown(relativePath, filename, isImage));
+				}
+			}
+
+			if (markdownParts.length === 0) return;
+
+			editor.executeEdits('clipboard-file-paste', [{
+				range: pasteEvent.range,
+				text: markdownParts.join('\n'),
+				forceMoveMarkers: true
+			}]);
+			editor.focus();
 		};
 
 		// Prevent browser's default dragover behavior
@@ -576,13 +682,17 @@
 			e.preventDefault();
 		};
 
+		const pasteDisposable = editor.onDidPaste((pasteEvent) => {
+			void handleClipboardFilesPaste(pasteEvent);
+		});
+
 		container.addEventListener('wheel', wheelListener, { capture: true });
-		// Note: Paste is now handled by Monaco addCommand instead of container listener
 		container.addEventListener('dragover', preventDefaultDragover, true);
 
 		return () => {
 			// Clean up listeners
 			mediaQuery.removeEventListener('change', updateTheme);
+			pasteDisposable.dispose();
 			container.removeEventListener('wheel', wheelListener, { capture: true });
 			container.removeEventListener('dragover', preventDefaultDragover, true);
 

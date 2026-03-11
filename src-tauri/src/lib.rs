@@ -492,13 +492,12 @@ fn copy_file_to_attachment(
     Ok(relative_path)
 }
 
-#[tauri::command]
-fn save_clipboard_image(
+fn save_bytes_to_attachment(
     document_path: String,
-    image_data: Vec<u8>,
+    file_data: Vec<u8>,
     filename: String,
+    is_image: bool,
 ) -> Result<String, String> {
-    // Validate document path
     let doc_path = Path::new(&document_path);
     if !doc_path.exists() {
         return Err("Document must be saved first".to_string());
@@ -506,25 +505,68 @@ fn save_clipboard_image(
 
     let attach_root_name = attachment_root_name(doc_path);
     let attach_root = attachment_root_dir(doc_path)?;
-    let images_dir = attach_root.join("images");
+    let attach_dir = if is_image {
+        attach_root.join("images")
+    } else {
+        attach_root.clone()
+    };
+    let subdir = if is_image {
+        format!("{}/images", attach_root_name)
+    } else {
+        attach_root_name.clone()
+    };
 
     let is_new_folder = !attach_root.exists();
 
-    fs::create_dir_all(&images_dir).map_err(|e| format!("Failed to create directory: {}", e))?;
+    fs::create_dir_all(&attach_dir).map_err(|e| format!("Failed to create directory: {}", e))?;
 
-    // Set hidden attribute on the attachment folder on Windows (only when newly created)
     #[cfg(target_os = "windows")]
     if is_new_folder && attach_root.exists() {
         hide_attachment_dir(&attach_root);
     }
 
-    // Save with date+random string filename
-    let image_path = images_dir.join(&filename);
+    let mut target_path = attach_dir.join(&filename);
+    let mut counter = 1;
 
-    fs::write(&image_path, image_data).map_err(|e| format!("Failed to write image: {}", e))?;
+    if target_path.exists() {
+        let stem = Path::new(&filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file");
+        let ext = Path::new(&filename)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
 
-    // Return relative path
-    Ok(format!("{}/images/{}", attach_root_name, filename))
+        while target_path.exists() {
+            let new_name = if ext.is_empty() {
+                format!("{}_{}", stem, counter)
+            } else {
+                format!("{}_{}.{}", stem, counter, ext)
+            };
+            target_path = attach_dir.join(new_name);
+            counter += 1;
+        }
+    }
+
+    fs::write(&target_path, file_data).map_err(|e| format!("Failed to write file: {}", e))?;
+
+    let saved_filename = target_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("Invalid filename")?;
+
+    Ok(format!("{}/{}", subdir, saved_filename))
+}
+
+#[tauri::command]
+fn save_clipboard_file(
+    document_path: String,
+    file_data: Vec<u8>,
+    filename: String,
+    is_image: bool,
+) -> Result<String, String> {
+    save_bytes_to_attachment(document_path, file_data, filename, is_image)
 }
 
 #[tauri::command]
@@ -871,6 +913,7 @@ pub fn run() {
         })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             println!("Single Instance Args: {:?}", args);
 
@@ -1026,7 +1069,7 @@ pub fn run() {
             get_system_fonts,
             get_os_type,
             copy_file_to_attachment,
-            save_clipboard_image,
+            save_clipboard_file,
             open_file,
             cleanup_unused_attachments,
         ])

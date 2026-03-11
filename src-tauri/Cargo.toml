@@ -41,6 +41,7 @@ chrono = "0.4"
 env_logger = "0.11.8"
 log = "0.4.29"
 font-kit = "0.14"
+tauri-plugin-clipboard = "2.1.11"
 
 
 [target.'cfg(windows)'.dependencies]
@@ -53,5 +54,3 @@ codegen-units = 1 # Compile crates one after another so the compiler can optimiz
 lto = true # Enables link to optimizations
 opt-level = "s" # Optimize for binary size
 strip = true # Remove debug symbols
-
-
