@@ -16,3 +16,8 @@ nul
 docs/.pdca-snapshots/*
 docs/.bkit-memory.json
 docs/.pdca-status.json
+/.idea/
+/.vscode/
+/.codex-temp-stage/
+/.claude/
+/src-tauri/target-codex*/
