@@ -242,6 +242,10 @@
 		// convert youtube links to embeds
 		for (const a of doc.querySelectorAll('a')) {
 			const href = a.getAttribute('href');
+			const resolvedPath = resolveLocalTargetPath(href, filePath);
+			if (resolvedPath) {
+				a.setAttribute('data-local-path', resolvedPath);
+			}
 			if (href && isYoutubeLink(href)) {
 				const parent = a.parentElement;
 				if (parent && (parent.tagName === 'P' || parent.tagName === 'DIV') && parent.childNodes.length === 1) {
@@ -452,36 +456,31 @@
 			throwOnError: false,
 		});
 
-		// Handle attachment links
-		const attachmentLinks = markdownBody.querySelectorAll('a[href^=".attachment_"]');
-		attachmentLinks.forEach((link) => {
+		// Handle local links directly on the anchor so browser navigation never wins.
+		const localLinks = markdownBody.querySelectorAll('a[data-local-path]');
+		localLinks.forEach((link) => {
 			const anchor = link as HTMLAnchorElement;
-			const rawHref = anchor.getAttribute('href');
-			if (!rawHref) return;
+			const localPath = anchor.dataset.localPath;
+			if (!localPath) return;
 
-			// Remove existing listener if any
-			const oldListener = (anchor as any)._attachmentClickHandler;
+			const oldListener = (anchor as any)._localClickHandler;
 			if (oldListener) {
 				anchor.removeEventListener('click', oldListener);
 			}
 
-			// Add new listener
 			const handler = async (e: MouseEvent) => {
 				e.preventDefault();
 				e.stopPropagation();
 
-				const currentTab = tabManager.activeTab;
-				if (!currentTab?.path) {
-					console.error('Cannot open attachment: no current document path');
-					return;
-				}
-
-				const resolved = resolvePath(currentTab.path, decodeMarkdownPath(rawHref));
-
 				try {
-					await invoke('open_file', { path: resolved });
+					const isMarkdown = ['.md', '.markdown', '.mdown', '.mkd'].some((ext) => localPath.toLowerCase().endsWith(ext));
+					if (isMarkdown) {
+						await loadMarkdown(localPath, { navigate: true });
+					} else {
+						await invoke('open_file', { path: localPath });
+					}
 				} catch (error) {
-					console.error('Failed to open attachment:', error);
+					console.error('Failed to open local link:', error);
 					await askCustom(
 						`Failed to open file: ${error}`,
 						{ title: 'Error', kind: 'error' }
@@ -490,7 +489,7 @@
 			};
 
 			anchor.addEventListener('click', handler);
-			(anchor as any)._attachmentClickHandler = handler;
+			(anchor as any)._localClickHandler = handler;
 		});
 	}
 
@@ -1115,14 +1114,14 @@
 		return current?.tagName === 'A' ? (current as HTMLAnchorElement) : null;
 	}
 
-	function resolveLocalTargetPath(rawPath: string | null): string | null {
-		if (!rawPath || !currentFile) return null;
+	function resolveLocalTargetPath(rawPath: string | null, basePath = currentFile): string | null {
+		if (!rawPath || !basePath) return null;
 		if (rawPath.startsWith('#') || rawPath.startsWith('data:') || rawPath.match(/^[a-z]+:\/\//i)) return null;
 
 		const pathWithoutHash = rawPath.split('#')[0].split('?')[0];
 		if (!pathWithoutHash) return null;
 
-		return resolvePath(currentFile, decodeMarkdownPath(pathWithoutHash));
+		return resolvePath(basePath, decodeMarkdownPath(pathWithoutHash));
 	}
 
 	function findContextMenuPath(target: EventTarget | null): string | null {
@@ -1134,6 +1133,7 @@
 
 		const targetAnchor = findContextMenuAnchor(target);
 		if (targetAnchor) {
+			if (targetAnchor.dataset.localPath) return targetAnchor.dataset.localPath;
 			return resolveLocalTargetPath(targetAnchor.getAttribute('href'));
 		}
 
@@ -1225,9 +1225,10 @@
 		while (target && target.tagName !== 'A' && target !== document.body) target = target.parentElement as HTMLElement;
 		if (target?.tagName === 'A') {
 			const anchor = target as HTMLAnchorElement;
-			if (anchor.href) {
+			const tooltipText = anchor.dataset.localPath || anchor.getAttribute('href') || anchor.href;
+			if (tooltipText) {
 				const rect = anchor.getBoundingClientRect();
-				tooltip = { show: true, text: anchor.href, x: rect.left + rect.width / 2, y: rect.top - 8 };
+				tooltip = { show: true, text: tooltipText, x: rect.left + rect.width / 2, y: rect.top - 8 };
 			}
 		}
 	}
@@ -1244,20 +1245,16 @@
 		while (target && target.tagName !== 'A' && target !== document.body) target = target.parentElement as HTMLElement;
 		if (target?.tagName === 'A') {
 			const anchor = target as HTMLAnchorElement;
+			const localPath = anchor.dataset.localPath;
 			const rawHref = anchor.getAttribute('href');
-			if (!rawHref) return;
+			if (!rawHref && !localPath) return;
 
-			if (rawHref.startsWith('#')) return;
-			const isMarkdown = ['.md', '.markdown', '.mdown', '.mkd'].some((ext) => {
-				const urlNoHash = rawHref.split('#')[0].split('?')[0];
-				return urlNoHash.toLowerCase().endsWith(ext);
-			});
+			if (rawHref?.startsWith('#')) return;
+			const localMarkdownPath = localPath && ['.md', '.markdown', '.mdown', '.mkd'].some((ext) => localPath.toLowerCase().endsWith(ext));
 
-			if (isMarkdown && !rawHref.match(/^[a-z]+:\/\//i)) {
+			if (localMarkdownPath) {
 				event.preventDefault();
-				const urlNoHash = rawHref.split('#')[0].split('?')[0];
-				const resolved = resolvePath(currentFile, decodeMarkdownPath(urlNoHash));
-				await loadMarkdown(resolved, { navigate: true });
+				await loadMarkdown(localPath, { navigate: true });
 				return;
 			}
 

@@ -576,33 +576,7 @@ fn save_clipboard_file(
 
 #[tauri::command]
 fn open_file(path: String) -> Result<(), String> {
-    use std::process::Command;
-
-    #[cfg(target_os = "windows")]
-    {
-        Command::new("cmd")
-            .args(&["/C", "start", "", &path])
-            .spawn()
-            .map_err(|e| format!("Failed to open file: {}", e))?;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| format!("Failed to open file: {}", e))?;
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        Command::new("xdg-open")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| format!("Failed to open file: {}", e))?;
-    }
-
-    Ok(())
+    opener::open(path).map_err(|e| format!("Failed to open file: {}", e))
 }
 
 #[tauri::command]
