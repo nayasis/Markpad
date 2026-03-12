@@ -1,9 +1,10 @@
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
+	import { onMount } from 'svelte';
 	import { tabManager } from '../stores/tabs.svelte.js';
 	import { settings } from '../stores/settings.svelte.js';
 	import { invoke } from '@tauri-apps/api/core';
 	import { message } from '@tauri-apps/plugin-dialog';
+	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { hasFiles, hasImage, hasText, readFiles, readImageBinary, readText as readClipboardText } from 'tauri-plugin-clipboard-api';
 	import { encodeMarkdownPath } from '../attachment-path.js';
 
@@ -131,6 +132,10 @@
 		return `[${filename}](${markdownPath})`;
 	}
 
+	function isExternalLink(resource: monaco.Uri): boolean {
+		return ['http', 'https', 'mailto'].includes(resource.scheme);
+	}
+
 	self.MonacoEnvironment = {
 		getWorker: function (_moduleId: any, label: string) {
 			if (label === 'json') {
@@ -195,6 +200,23 @@
 			fontFamily: settings.editorFont,
 			wordBasedSuggestions: 'off',
 			quickSuggestions: false,
+		});
+
+		const linkOpenerDisposable = monaco.editor.registerLinkOpener({
+			async open(resource) {
+				if (!isExternalLink(resource)) {
+					return false;
+				}
+
+				try {
+					await openUrl(resource.toString());
+					return true;
+				} catch (error) {
+					console.error('Failed to open editor link:', error);
+					window.open(resource.toString(), '_blank', 'noopener,noreferrer');
+					return true;
+				}
+			},
 		});
 
 		if (tabManager.activeTab?.editorViewState) {
@@ -693,6 +715,7 @@
 			// Clean up listeners
 			mediaQuery.removeEventListener('change', updateTheme);
 			pasteDisposable.dispose();
+			linkOpenerDisposable.dispose();
 			container.removeEventListener('wheel', wheelListener, { capture: true });
 			container.removeEventListener('dragover', preventDefaultDragover, true);
 
