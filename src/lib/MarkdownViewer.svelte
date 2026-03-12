@@ -6,6 +6,7 @@
 	import { fly } from 'svelte/transition';
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { open, save, ask } from '@tauri-apps/plugin-dialog';
+	import { writeImageBinary } from 'tauri-plugin-clipboard-api';
 	import Installer from './Installer.svelte';
 	import Uninstaller from './Uninstaller.svelte';
 	import Settings from './components/Settings.svelte';
@@ -203,8 +204,10 @@
 			let finalSrc = src;
 			if (src && !src.startsWith('http') && !src.startsWith('data:')) {
 				const decodedSrc = decodeMarkdownPath(src);
-				finalSrc = convertFileSrc(resolvePath(filePath, decodedSrc));
+				const resolvedPath = resolvePath(filePath, decodedSrc);
+				finalSrc = convertFileSrc(resolvedPath);
 				img.setAttribute('src', finalSrc);
+				img.setAttribute('data-local-path', resolvedPath);
 			}
 
 			if (src) {
@@ -217,6 +220,7 @@
 					media.setAttribute('controls', '');
 					media.setAttribute('src', finalSrc || '');
 					media.style.maxWidth = '100%';
+					if (img.dataset.localPath) media.setAttribute('data-local-path', img.dataset.localPath);
 
 					// Copy attributes
 					if (img.hasAttribute('width')) media.setAttribute('width', img.getAttribute('width')!);
@@ -1081,19 +1085,130 @@
 		}
 	}
 
+	function findContextMenuImage(target: EventTarget | null): HTMLImageElement | null {
+		let current = target instanceof HTMLElement ? target : null;
+		while (current && current !== document.body) {
+			if (current instanceof HTMLImageElement) {
+				return current;
+			}
+			current = current.parentElement;
+		}
+		return null;
+	}
+
+	function findContextMenuMedia(target: EventTarget | null): HTMLMediaElement | null {
+		let current = target instanceof HTMLElement ? target : null;
+		while (current && current !== document.body) {
+			if (current instanceof HTMLVideoElement || current instanceof HTMLAudioElement) {
+				return current;
+			}
+			current = current.parentElement;
+		}
+		return null;
+	}
+
+	function findContextMenuAnchor(target: EventTarget | null): HTMLAnchorElement | null {
+		let current = target instanceof HTMLElement ? target : null;
+		while (current && current.tagName !== 'A' && current !== document.body) {
+			current = current.parentElement as HTMLElement;
+		}
+		return current?.tagName === 'A' ? (current as HTMLAnchorElement) : null;
+	}
+
+	function resolveLocalTargetPath(rawPath: string | null): string | null {
+		if (!rawPath || !currentFile) return null;
+		if (rawPath.startsWith('#') || rawPath.startsWith('data:') || rawPath.match(/^[a-z]+:\/\//i)) return null;
+
+		const pathWithoutHash = rawPath.split('#')[0].split('?')[0];
+		if (!pathWithoutHash) return null;
+
+		return resolvePath(currentFile, decodeMarkdownPath(pathWithoutHash));
+	}
+
+	function findContextMenuPath(target: EventTarget | null): string | null {
+		const targetImage = findContextMenuImage(target);
+		if (targetImage?.dataset.localPath) return targetImage.dataset.localPath;
+
+		const targetMedia = findContextMenuMedia(target);
+		if (targetMedia?.dataset.localPath) return targetMedia.dataset.localPath;
+
+		const targetAnchor = findContextMenuAnchor(target);
+		if (targetAnchor) {
+			return resolveLocalTargetPath(targetAnchor.getAttribute('href'));
+		}
+
+		return null;
+	}
+
+	function decodeImageDataUrl(dataUrl: string): number[] {
+		const [, base64 = ''] = dataUrl.split(',', 2);
+		return Array.from(Uint8Array.from(atob(base64), (char) => char.charCodeAt(0)));
+	}
+
+	async function copyPathToClipboard(path: string) {
+		try {
+			await navigator.clipboard.writeText(path);
+		} catch (error) {
+			console.error('Failed to copy path:', error);
+			await askCustom(`Failed to copy path: ${error}`, { title: 'Error', kind: 'error' });
+		}
+	}
+
+	async function copyImageToClipboard(image: HTMLImageElement) {
+		try {
+			let bytes: number[];
+			const localPath = image.dataset.localPath;
+
+			if (localPath) {
+				bytes = await invoke<number[]>('read_binary_file', { path: localPath });
+			} else {
+				const imageSource = image.currentSrc || image.src;
+				if (imageSource.startsWith('data:')) {
+					bytes = decodeImageDataUrl(imageSource);
+				} else {
+					const response = await fetch(imageSource);
+					if (!response.ok) {
+						throw new Error(`Failed to fetch image: ${response.status}`);
+					}
+					bytes = Array.from(new Uint8Array(await response.arrayBuffer()));
+				}
+			}
+
+			await writeImageBinary(bytes);
+		} catch (error) {
+			console.error('Failed to copy image:', error);
+			await askCustom(`Failed to copy image: ${error}`, { title: 'Error', kind: 'error' });
+		}
+	}
+
 	function handleContextMenu(e: MouseEvent) {
 		if (mode !== 'app') return;
 		e.preventDefault();
 
 		const selection = window.getSelection();
 		const hasSelection = selection ? selection.toString().length > 0 : false;
+		const targetImage = findContextMenuImage(e.target);
+		const targetPath = findContextMenuPath(e.target);
+		const copyItems: ContextMenuItem[] = [];
+
+		if (targetImage) {
+			copyItems.push({ label: 'Copy', onClick: () => void copyImageToClipboard(targetImage) });
+		}
+
+		if (targetPath) {
+			copyItems.push({ label: 'Copy Path', detail: targetPath, onClick: () => void copyPathToClipboard(targetPath) });
+		}
+
+		if (!copyItems.length && hasSelection) {
+			copyItems.push({ label: 'Copy', onClick: () => document.execCommand('copy') });
+		}
 
 		docContextMenu = {
 			show: true,
 			x: e.clientX,
 			y: e.clientY,
 			items: [
-				...(hasSelection ? [{ label: 'Copy', onClick: () => document.execCommand('copy') }] : []),
+				...copyItems,
 				{ label: 'Select All', onClick: () => document.execCommand('selectAll') },
 				{ separator: true },
 				{ label: 'Open File Location', onClick: openFileLocation, disabled: !currentFile },

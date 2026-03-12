@@ -312,6 +312,11 @@ fn read_file_content(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn read_binary_file(path: String) -> Result<Vec<u8>, String> {
+    fs::read(path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn save_file_content(path: String, content: String) -> Result<(), String> {
     fs::write(path, content).map_err(|e| e.to_string())
 }
@@ -1052,6 +1057,7 @@ pub fn run() {
             render_markdown,
             send_markdown_path,
             read_file_content,
+            read_binary_file,
             save_file_content,
             prepare_save_as_content,
             copy_attachments_for_save_as,
