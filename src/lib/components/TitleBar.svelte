@@ -22,6 +22,8 @@
 		onopenFile,
 		onsaveFile,
 		onsaveFileAs,
+		onback,
+		onforward,
 		onexit,
 		ontoggleHome,
 		ononpenFileLocation,
@@ -55,6 +57,8 @@
 		onopenFile?: () => void;
 		onsaveFile?: () => void;
 		onsaveFileAs?: () => void;
+		onback?: () => void;
+		onforward?: () => void;
 		onexit?: () => void;
 		ontoggleHome: () => void;
 		ononpenFileLocation: () => void;
@@ -171,12 +175,13 @@
 		}
 	});
 
-	const inlineIds = ['fullWidth', 'edit', 'split', 'sync', 'live'];
+	const inlineIds = ['back', 'forward', 'fullWidth', 'edit', 'split', 'sync', 'live'];
 
 	let visibleActionIds = $derived.by(() => {
 		const list: string[] = [];
 
 		if (tabManager.activeTab && !showHome) {
+			list.push('back', 'forward');
 			if (currentFile) list.push('open_loc');
 
 			const ext = currentFile ? currentFile.split('.').pop()?.toLowerCase() || '' : 'md';
@@ -237,6 +242,9 @@
 			window.removeEventListener('click', handleGlobalClick);
 		};
 	});
+
+	let canGoBack = $derived(tabManager.activeTab ? tabManager.canGoBack(tabManager.activeTab.id) || tabManager.canGoBackLinked(tabManager.activeTab.id) : false);
+	let canGoForward = $derived(tabManager.activeTab ? tabManager.canGoForward(tabManager.activeTab.id) || tabManager.canGoForwardLinked(tabManager.activeTab.id) : false);
 </script>
 
 <svelte:window bind:innerWidth />
@@ -513,6 +521,38 @@
 								y2="10"></line
 							></svg>
 						<span class="action-label">Open Location</span>
+					</button>
+				{:else if id === 'back'}
+					<button
+						class="title-action-btn"
+						onclick={() => onback?.()}
+						disabled={!canGoBack}
+						aria-label="Go Back"
+						onmouseenter={(e) => showTooltip(e, 'Go back')}
+						onmouseleave={hideTooltip}
+						transition:fly={{ x: 10, duration: 200 }}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+							<path d="M19 12H5"></path>
+							<path d="M12 19l-7-7 7-7"></path>
+						</svg>
+						<span class="action-label">Back</span>
+						<span class="menu-shortcut">Alt+Left</span>
+					</button>
+				{:else if id === 'forward'}
+					<button
+						class="title-action-btn"
+						onclick={() => onforward?.()}
+						disabled={!canGoForward}
+						aria-label="Go Forward"
+						onmouseenter={(e) => showTooltip(e, 'Go forward')}
+						onmouseleave={hideTooltip}
+						transition:fly={{ x: 10, duration: 200 }}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+							<path d="M5 12h14"></path>
+							<path d="M12 5l7 7-7 7"></path>
+						</svg>
+						<span class="action-label">Forward</span>
+						<span class="menu-shortcut">Alt+Right</span>
 					</button>
 				{:else if id === 'split'}
 					<button
@@ -866,6 +906,11 @@
 		border-radius: 4px;
 		cursor: pointer;
 		transition: all 0.1s;
+	}
+
+	.title-action-btn:disabled {
+		opacity: 0.35;
+		cursor: default;
 	}
 
 	.title-actions.show-dropdown .menu-zoom-item {

@@ -299,7 +299,7 @@
 		return doc.body.innerHTML;
 	}
 
-	async function loadMarkdown(filePath: string, options: { navigate?: boolean; skipTabManagement?: boolean; activate?: boolean; fragment?: string | null } = {}) {
+	async function loadMarkdown(filePath: string, options: { navigate?: boolean; skipTabManagement?: boolean; activate?: boolean; fragment?: string | null; linkedFromTabId?: string | null } = {}) {
 		showHome = false;
 		const normalizedFilePath = normalizeComparablePath(filePath);
 		try {
@@ -344,6 +344,12 @@
 			if (liveMode) invoke('watch_file', { path: filePath }).catch(console.error);
 
 			await tick();
+			if (options.linkedFromTabId && options.linkedFromTabId !== activeId) {
+				tabManager.recordLinkedTabNavigation(options.linkedFromTabId, activeId);
+			}
+			if (options.fragment && !options.skipTabManagement) {
+				tabManager.navigate(activeId, filePath, options.fragment);
+			}
 			if (options.fragment && shouldActivate && activeId === tabManager.activeTabId) {
 				scrollToFragment(options.fragment);
 			}
@@ -488,11 +494,12 @@
 			const handler = async (e: MouseEvent) => {
 				e.preventDefault();
 				e.stopPropagation();
+				const linkedFromTabId = tabManager.activeTabId;
 
 				try {
 					const isMarkdown = ['.md', '.markdown', '.mdown', '.mkd'].some((ext) => localPath.toLowerCase().endsWith(ext));
 					if (isMarkdown) {
-						await loadMarkdown(localPath, { fragment: localFragment });
+						await loadMarkdown(localPath, { fragment: localFragment, linkedFromTabId });
 					} else {
 						await invoke('open_file', { path: localPath });
 					}
@@ -792,6 +799,35 @@
 			isProgrammaticScroll = true;
 			markdownBody.scrollTop = targetScroll;
 		}
+	}
+
+	function scrollPreviewToTop() {
+		if (!markdownBody) return;
+
+		if (tabManager.activeTabId) {
+			tabManager.updateTabScroll(tabManager.activeTabId, 0);
+			tabManager.updateTabScrollPercentage(tabManager.activeTabId, 0);
+			tabManager.updateTabAnchorLine(tabManager.activeTabId, 0);
+		}
+
+		if (markdownBody.scrollTop !== 0) {
+			isProgrammaticScroll = true;
+			markdownBody.scrollTop = 0;
+		}
+	}
+
+	function navigateToHistoryLocation(location: { path: string; fragment: string | null }) {
+		const activePath = tabManager.activeTab?.path ?? '';
+		if (normalizeComparablePath(activePath) === normalizeComparablePath(location.path)) {
+			if (location.fragment) {
+				scrollToFragment(location.fragment);
+			} else {
+				scrollPreviewToTop();
+			}
+			return;
+		}
+
+		loadMarkdown(location.path, { skipTabManagement: true, fragment: location.fragment });
 	}
 
 	function resolvePath(basePath: string, relativePath: string) {
@@ -1332,6 +1368,9 @@
 				event.preventDefault();
 				const fragment = extractLinkFragment(rawHref);
 				if (fragment) {
+					if (tabManager.activeTabId && currentFile) {
+						tabManager.navigate(tabManager.activeTabId, currentFile, fragment);
+					}
 					scrollToFragment(fragment);
 				}
 				return;
@@ -1340,7 +1379,7 @@
 
 			if (localMarkdownPath) {
 				event.preventDefault();
-				await loadMarkdown(localPath, { fragment: localFragment });
+				await loadMarkdown(localPath, { fragment: localFragment, linkedFromTabId: tabManager.activeTabId });
 				return;
 			}
 
@@ -1444,6 +1483,14 @@
 			e.preventDefault();
 			closeFile();
 		}
+		if (e.altKey && !cmdOrCtrl && key === 'arrowleft') {
+			e.preventDefault();
+			handleHistoryBack();
+		}
+		if (e.altKey && !cmdOrCtrl && key === 'arrowright') {
+			e.preventDefault();
+			handleHistoryForward();
+		}
 		if (cmdOrCtrl && !e.shiftKey && key === 't') {
 			e.preventDefault();
 			tabManager.addHomeTab();
@@ -1495,16 +1542,40 @@
 		if (e.button === 3) {
 			// Back
 			e.preventDefault();
-			if (tabManager.activeTabId) {
-				const path = tabManager.goBack(tabManager.activeTabId);
-				if (path) loadMarkdown(path, { skipTabManagement: true });
-			}
+			handleHistoryBack();
 		} else if (e.button === 4) {
 			// Forward
 			e.preventDefault();
-			if (tabManager.activeTabId) {
-				const path = tabManager.goForward(tabManager.activeTabId);
-				if (path) loadMarkdown(path, { skipTabManagement: true });
+			handleHistoryForward();
+		}
+	}
+
+	function handleHistoryBack() {
+		if (tabManager.activeTabId) {
+			const location = tabManager.goBack(tabManager.activeTabId);
+			if (location) {
+				navigateToHistoryLocation(location);
+				return;
+			}
+
+			const targetTabId = tabManager.goBackLinked(tabManager.activeTabId);
+			if (targetTabId) {
+				tabManager.setActive(targetTabId);
+			}
+		}
+	}
+
+	function handleHistoryForward() {
+		if (tabManager.activeTabId) {
+			const location = tabManager.goForward(tabManager.activeTabId);
+			if (location) {
+				navigateToHistoryLocation(location);
+				return;
+			}
+
+			const targetTabId = tabManager.goForwardLinked(tabManager.activeTabId);
+			if (targetTabId) {
+				tabManager.setActive(targetTabId);
 			}
 		}
 	}
@@ -1799,6 +1870,8 @@
 		onopenFile={selectFile}
 		onsaveFile={saveContent}
 		onsaveFileAs={saveContentAs}
+		onback={handleHistoryBack}
+		onforward={handleHistoryForward}
 		onexit={() => {
 			appWindow.close();
 		}}
@@ -1844,6 +1917,8 @@
 		onopenFile={selectFile}
 		onsaveFile={saveContent}
 		onsaveFileAs={saveContentAs}
+		onback={handleHistoryBack}
+		onforward={handleHistoryForward}
 		onexit={() => {
 			appWindow.close();
 		}}
