@@ -1306,7 +1306,7 @@
 		const copyItems: ContextMenuItem[] = [];
 
 		if (targetImage) {
-			copyItems.push({ label: 'Copy', onClick: () => void copyImageToClipboard(targetImage) });
+			copyItems.push({ label: 'Copy Image', onClick: () => void copyImageToClipboard(targetImage) });
 		}
 
 		if (targetPath) {
