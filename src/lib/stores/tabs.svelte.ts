@@ -97,7 +97,7 @@ class TabManager {
 			anchorLine: 0,
 			isSplit: false,
 			splitRatio: 0.5,
-			isScrollSynced: false
+			isScrollSynced: true
 		});
 
 		if (activate) {
@@ -128,7 +128,7 @@ class TabManager {
 			anchorLine: 0,
 			isSplit: false,
 			splitRatio: 0.5,
-			isScrollSynced: false
+			isScrollSynced: true
 		});
 
 		this.activeTabId = id;
@@ -160,7 +160,7 @@ class TabManager {
 			anchorLine: 0,
 			isSplit: false,
 			splitRatio: 0.5,
-			isScrollSynced: false
+			isScrollSynced: true
 		});
 
 		this.activeTabId = id;

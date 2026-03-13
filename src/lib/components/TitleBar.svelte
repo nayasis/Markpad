@@ -32,6 +32,7 @@
 		ontoggleEdit,
 		ontoggleSplit,
 		isEditing,
+		isSplit,
 		ondetach,
 		ontabclick,
 		zoomLevel,
@@ -67,6 +68,7 @@
 		ontoggleEdit: () => void;
 		ontoggleSplit?: () => void;
 		isEditing: boolean;
+		isSplit?: boolean;
 		ondetach: (tabId: string) => void;
 		ontabclick?: () => void;
 		zoomLevel?: number;
@@ -188,14 +190,14 @@
 			const isMarkdown = ['md', 'markdown', 'mdown', 'mkd'].includes(ext);
 
 			if (isMarkdown) {
-				if (!tabManager.activeTab?.isSplit) {
+				if (!isSplit) {
 					list.push('fullWidth');
 					if (!isEditing && currentFile) {
 						list.push('live');
 					}
 					list.push('edit');
 				}
-				if (tabManager.activeTab?.isSplit) {
+				if (isSplit) {
 					list.push('sync');
 				}
 				list.push('split');
@@ -335,7 +337,7 @@
 						Open File...
 						<span class="menu-shortcut">{modifier}+O</span>
 					</button>
-					{#if currentFile !== '' || (tabManager.activeTab && tabManager.activeTab.isEditing)}
+					{#if currentFile !== '' || isEditing || isSplit}
 						<button
 							class="home-menu-item"
 							onclick={() => {
@@ -556,7 +558,7 @@
 					</button>
 				{:else if id === 'split'}
 					<button
-						class="title-action-btn {tabManager.activeTab?.isSplit ? 'active' : ''}"
+						class="title-action-btn {isSplit ? 'active' : ''}"
 						onclick={() => ontoggleSplit?.()}
 						aria-label="Toggle Split View"
 						onmouseenter={(e) => showTooltip(e, 'Split view', 'H')}

@@ -47,6 +47,8 @@
 		edge: 'top' | 'bottom' | null;
 	};
 
+	type ViewMode = 'viewer' | 'edit' | 'split';
+
 	let showSettings = $state(false);
 
 	let recentFiles = $state<string[]>([]);
@@ -60,12 +62,14 @@
 	let lastScrollSyncSource = $state<'editor' | 'viewer'>('editor');
 	let pendingScrollSyncFrame = 0;
 	let previewImageResizeObserver: ResizeObserver | null = null;
+	let viewMode = $state<ViewMode>((typeof localStorage !== 'undefined' ? (localStorage.getItem('editor.viewMode') as ViewMode | null) : null) ?? 'viewer');
 
 	// derived from tab manager
 	let activeTab = $derived(tabManager.activeTab);
-	let isEditing = $derived(activeTab?.isEditing ?? false);
+	let activeTabSupportsPreview = $derived(tabSupportsPreview(activeTab));
+	let isEditing = $derived(!activeTabSupportsPreview || viewMode === 'edit');
 	let rawContent = $derived(activeTab?.rawContent ?? '');
-	let isSplit = $derived(activeTab?.isSplit ?? false);
+	let isSplit = $derived(activeTabSupportsPreview && viewMode === 'split');
 
 	// derived from tab manager
 	let currentFile = $derived(tabManager.activeTab?.path ?? '');
@@ -87,6 +91,38 @@
 
 	$effect(() => {
 		localStorage.setItem('isFullWidth', String(isFullWidth));
+	});
+
+	$effect(() => {
+		localStorage.setItem('editor.viewMode', viewMode);
+	});
+
+	$effect(() => {
+		const activeTabId = tabManager.activeTabId;
+		const editorVisible = isEditing || isSplit;
+
+		if (!activeTabId || !editorVisible) return;
+
+		untrack(() => {
+			const tab = tabManager.tabs.find((candidate) => candidate.id === activeTabId);
+			if (tab) {
+				void ensureEditorContentLoaded(tab);
+			}
+		});
+	});
+
+	$effect(() => {
+		const activeTabId = tabManager.activeTabId;
+		const viewerVisible = !isEditing && !isSplit;
+
+		if (!activeTabId || !viewerVisible) return;
+
+		untrack(() => {
+			const tab = tabManager.tabs.find((candidate) => candidate.id === activeTabId);
+			if (tab?.isDirty && tabSupportsPreview(tab)) {
+				void renderPreviewFromRaw(tab);
+			}
+		});
 	});
 
 	// Theme State
@@ -342,12 +378,10 @@
 			const tab = tabManager.tabs.find((t) => t.id === activeId);
 
 			if (isMarkdown) {
-				if (tab) tab.isEditing = false;
 				const html = (await invoke('open_markdown', { path: filePath })) as string;
 				const processedInfo = processMarkdownHtml(html, filePath);
 				tabManager.updateTabContent(activeId, processedInfo);
 			} else {
-				if (tab) tab.isEditing = true;
 				const content = (await invoke('read_file_content', { path: filePath })) as string;
 				tabManager.setTabRawContent(activeId, content);
 			}
@@ -363,6 +397,9 @@
 			}
 			if (options.fragment && shouldActivate && activeId === tabManager.activeTabId) {
 				scrollToFragment(options.fragment);
+			}
+			if (shouldActivate && (viewMode === 'edit' || viewMode === 'split') && tab) {
+				void ensureEditorContentLoaded(tab);
 			}
 			if (filePath) saveRecentFile(filePath);
 		} catch (error) {
@@ -820,34 +857,36 @@
 		editorPane.syncScrollToLine(scrollState.line, scrollState.ratio);
 	}
 
+	function syncPreviewState(target: HTMLElement, syncEditor = false) {
+		if (tabManager.activeTabId) {
+			tabManager.updateTabScroll(tabManager.activeTabId, target.scrollTop);
+
+			if (target.scrollHeight > target.clientHeight) {
+				const percentage = target.scrollTop / (target.scrollHeight - target.clientHeight);
+				tabManager.updateTabScrollPercentage(tabManager.activeTabId, percentage);
+			} else {
+				tabManager.updateTabScrollPercentage(tabManager.activeTabId, 0);
+			}
+
+			const scrollState = getPreviewScrollSyncState(target);
+			tabManager.updateTabAnchorLine(tabManager.activeTabId, scrollState?.line ?? 0);
+		}
+
+		if (syncEditor) {
+			syncEditorToPreviewScroll(target);
+		}
+	}
+
 	function handleScroll(e: Event) {
 		const target = e.target as HTMLElement;
 
 		if (isProgrammaticScroll) {
 			isProgrammaticScroll = false;
-			if (tabManager.activeTabId) {
-				tabManager.updateTabScroll(tabManager.activeTabId, target.scrollTop);
-			}
+			syncPreviewState(target);
 			return;
 		}
 
-		if (tabManager.activeTabId) {
-			// Update raw scroll pos
-			tabManager.updateTabScroll(tabManager.activeTabId, target.scrollTop);
-
-			// Percentage fallback
-			if (target.scrollHeight > target.clientHeight) {
-				const percentage = target.scrollTop / (target.scrollHeight - target.clientHeight);
-				tabManager.updateTabScrollPercentage(tabManager.activeTabId, percentage);
-			}
-
-			const scrollState = getPreviewScrollSyncState(target);
-			if (scrollState) {
-				tabManager.updateTabAnchorLine(tabManager.activeTabId, scrollState.line);
-			}
-		}
-
-		syncEditorToPreviewScroll(target);
+		syncPreviewState(target, true);
 	}
 
 	function saveRecentFile(path: string) {
@@ -856,6 +895,89 @@
 		files.unshift(path);
 		recentFiles = files.slice(0, 9);
 		localStorage.setItem('recent-files', JSON.stringify(recentFiles));
+	}
+
+	function tabSupportsPreview(tab: typeof tabManager.activeTab) {
+		if (!tab || tab.path === 'HOME') return false;
+		if (tab.path === '') return true;
+
+		const ext = tab.path.split('.').pop()?.toLowerCase() || '';
+		return ['md', 'markdown', 'mdown', 'mkd'].includes(ext);
+	}
+
+	async function ensureEditorContentLoaded(tab = tabManager.activeTab) {
+		if (!tab || !tab.path || tab.path === 'HOME' || tab.isDirty) return;
+
+		try {
+			const content = (await invoke('read_file_content', { path: tab.path })) as string;
+			if (tabManager.activeTabId !== tab.id) return;
+
+			tab.rawContent = content;
+			tab.originalContent = content;
+			tab.isDirty = false;
+		} catch (error) {
+			console.error('Failed to load file for editing', error);
+		}
+	}
+
+	async function renderPreviewFromRaw(tab = tabManager.activeTab) {
+		if (!tab || !tabSupportsPreview(tab)) return;
+
+		try {
+			const html = (await invoke('render_markdown', { content: tab.rawContent })) as string;
+			const processedInfo = processMarkdownHtml(html, tab.path);
+			tabManager.updateTabContent(tab.id, processedInfo);
+		} catch (error) {
+			console.error('Failed to render markdown preview', error);
+		}
+	}
+
+	async function setViewMode(nextMode: ViewMode, autoSave = false) {
+		const tab = tabManager.activeTab;
+		if (!tab) return;
+
+		const currentMode: ViewMode = isSplit ? 'split' : isEditing ? 'edit' : 'viewer';
+		if (currentMode === nextMode) return;
+
+		if (nextMode === 'viewer') {
+			if ((isEditing || isSplit) && tab.isDirty && tab.path !== '') {
+				if (autoSave) {
+					const success = await saveContent();
+					if (!success) return;
+				} else {
+					const response = await askCustom('You have unsaved changes. Do you want to save them before returning to view mode?', {
+						title: 'Unsaved Changes',
+						kind: 'warning',
+						showSave: true,
+					});
+
+					if (response === 'cancel') return;
+					if (response === 'save') {
+						const success = await saveContent();
+						if (!success) return;
+					} else if (response === 'discard') {
+						tab.rawContent = tab.originalContent;
+					}
+				}
+			}
+
+			viewMode = 'viewer';
+			if (tab.path !== '') {
+				tab.isDirty = false;
+				await loadMarkdown(tab.path, { skipTabManagement: true, activate: false });
+			} else {
+				await renderPreviewFromRaw(tab);
+			}
+			return;
+		}
+
+		await ensureEditorContentLoaded(tab);
+		viewMode = nextMode;
+
+		if (nextMode === 'split') {
+			tabManager.setSplitEnabled(tab.id, true);
+			if (liveMode) toggleLiveMode();
+		}
 	}
 
 	function loadRecentFiles() {
@@ -938,21 +1060,19 @@
 			isProgrammaticScroll = true;
 			markdownBody.scrollTop = targetScroll;
 		}
+
+		syncPreviewState(markdownBody, true);
 	}
 
 	function scrollPreviewToTop() {
 		if (!markdownBody) return;
 
-		if (tabManager.activeTabId) {
-			tabManager.updateTabScroll(tabManager.activeTabId, 0);
-			tabManager.updateTabScrollPercentage(tabManager.activeTabId, 0);
-			tabManager.updateTabAnchorLine(tabManager.activeTabId, 0);
-		}
-
 		if (markdownBody.scrollTop !== 0) {
 			isProgrammaticScroll = true;
 			markdownBody.scrollTop = 0;
 		}
+
+		syncPreviewState(markdownBody, true);
 	}
 
 	function navigateToHistoryLocation(location: { path: string; fragment: string | null }) {
@@ -1129,64 +1249,12 @@
 	}
 
 	async function toggleEdit(autoSave = false) {
-		const tab = tabManager.activeTab;
-		if (!tab || tab.path === undefined) return;
-
-		if (isEditing) {
-			// Switch back to view
-			if (tab.isDirty && tab.path !== '') {
-				if (autoSave) {
-					const success = await saveContent();
-					if (!success) return; // If save fails, stay in edit mode?
-				} else {
-					const response = await askCustom('You have unsaved changes. Do you want to save them before returning to view mode?', {
-						title: 'Unsaved Changes',
-						kind: 'warning',
-						showSave: true,
-					});
-
-					if (response === 'cancel') return;
-					if (response === 'save') {
-						const success = await saveContent();
-						if (!success) return;
-					} else if (response === 'discard') {
-						tab.rawContent = tab.originalContent;
-					}
-				}
-			}
-			tab.isEditing = false;
-			if (tab.path !== '') {
-				tab.isDirty = false;
-				await loadMarkdown(tab.path);
-			} else {
-				try {
-					const html = (await invoke('render_markdown', { content: tab.rawContent })) as string;
-					const processedInfo = processMarkdownHtml(html, '');
-					tabManager.updateTabContent(tab.id, processedInfo);
-				} catch (e) {
-					console.error('Failed to render markdown for unsaved file', e);
-				}
-			}
-		} else {
-			// Switch to edit
-			if (tab.path !== '') {
-				try {
-					const content = (await invoke('read_file_content', { path: tab.path })) as string;
-					tab.rawContent = content;
-					tab.isEditing = true;
-					tab.isDirty = false;
-				} catch (e) {
-					console.error('Failed to read file for editing', e);
-				}
-			} else {
-				tab.isEditing = true;
-			}
-		}
+		await setViewMode(isEditing ? 'viewer' : 'edit', autoSave);
 	}
 
 	async function saveContent(): Promise<boolean> {
 		const tab = tabManager.activeTab;
-		if (!tab || (!tab.isEditing && !tab.isSplit)) return false;
+		if (!tab || (!isEditing && !isSplit)) return false;
 
 		let targetPath = tab.path;
 
@@ -1248,7 +1316,7 @@
 			try {
 				let contentToSave = tab.rawContent;
 
-				if (!tab.isEditing && !tab.isSplit && tab.path) {
+				if (!isEditing && !isSplit && tab.path) {
 					contentToSave = await invoke<string>('read_file_content', { path: tab.path });
 				}
 
@@ -1549,7 +1617,7 @@
 
 	$effect(() => {
 		const tab = tabManager.activeTab;
-		if (tab && tab.isSplit && tab.rawContent !== undefined) {
+		if (tab && isSplit && tab.rawContent !== undefined) {
 			clearTimeout(debounceTimer);
 			debounceTimer = setTimeout(() => {
 				invoke('render_markdown', { content: tab.rawContent })
@@ -1564,49 +1632,8 @@
 	});
 
 	async function toggleSplitView(tabId: string, autoSave = false) {
-		const tab = tabManager.tabs.find((t) => t.id === tabId);
-		if (!tab) return;
-
-		if (!tab.isSplit) {
-			if (!tab.isEditing && !tab.rawContent && tab.path) {
-				try {
-					const content = (await invoke('read_file_content', { path: tab.path })) as string;
-					tab.rawContent = content;
-					tab.originalContent = content;
-				} catch (e) {
-					console.error('Failed to load raw content for split view', e);
-				}
-			}
-			tabManager.setSplitEnabled(tab.id, true);
-			if (liveMode) toggleLiveMode();
-		} else {
-			if (tab.isDirty && tab.path !== '') {
-				if (autoSave) {
-					const success = await saveContent();
-					if (!success) return;
-				} else {
-					const response = await askCustom('You have unsaved changes. Do you want to save them before closing split view?', {
-						title: 'Unsaved Changes',
-						kind: 'warning',
-						showSave: true,
-					});
-
-					if (response === 'cancel') return;
-					if (response === 'save') {
-						const success = await saveContent();
-						if (!success) return;
-					} else if (response === 'discard') {
-						tab.rawContent = tab.originalContent;
-					}
-				}
-			}
-			tabManager.setSplitEnabled(tab.id, false);
-			if (tab.path !== '') {
-				tab.isDirty = false;
-				await loadMarkdown(tab.path);
-			} else {
-			}
-		}
+		void tabId;
+		await setViewMode(isSplit ? 'viewer' : 'split', autoSave);
 	}
 
 	function handleKeyDown(e: KeyboardEvent) {
@@ -1615,8 +1642,6 @@
 		const cmdOrCtrl = e.ctrlKey || e.metaKey;
 		const key = e.key.toLowerCase();
 		const code = e.code;
-
-		const isSplit = tabManager.activeTab?.isSplit;
 
 		if (cmdOrCtrl && key === 'w') {
 			e.preventDefault();
@@ -1952,7 +1977,7 @@
 
 						const currentTab = tabManager.activeTab;
 						// Editor is visible in both full edit mode (isEditing) and split view mode (isSplit)
-						const shouldAttachFile = currentTab && (currentTab.isEditing || currentTab.isSplit);
+						const shouldAttachFile = currentTab && (isEditing || isSplit);
 
 						if (shouldAttachFile) {
 							// Editor mode or Split view: attach files
@@ -2020,6 +2045,7 @@
 		ontoggleEdit={() => toggleEdit()}
 		ontoggleSplit={() => tabManager.activeTabId && toggleSplitView(tabManager.activeTabId)}
 		{isEditing}
+		{isSplit}
 		ondetach={handleDetach}
 		ontabclick={() => (showHome = false)}
 		onresetZoom={() => (zoomLevel = 100)}
@@ -2067,6 +2093,7 @@
 		ontoggleEdit={() => toggleEdit()}
 		ontoggleSplit={() => tabManager.activeTabId && toggleSplitView(tabManager.activeTabId)}
 		{isEditing}
+		{isSplit}
 		ondetach={handleDetach}
 		ontabclick={() => (showHome = false)}
 		onresetZoom={() => (zoomLevel = 100)}
