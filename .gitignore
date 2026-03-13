@@ -19,5 +19,6 @@ docs/.pdca-status.json
 /.idea/
 /.vscode/
 /.codex-temp-stage/
+/.codex-cargo-check/
 /.claude/
 /src-tauri/target-codex*/
