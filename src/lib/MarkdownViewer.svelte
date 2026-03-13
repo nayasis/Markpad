@@ -246,6 +246,10 @@
 			if (resolvedPath) {
 				a.setAttribute('data-local-path', resolvedPath);
 			}
+			const fragment = extractLinkFragment(href);
+			if (fragment) {
+				a.setAttribute('data-local-fragment', fragment);
+			}
 			if (href && isYoutubeLink(href)) {
 				const parent = a.parentElement;
 				if (parent && (parent.tagName === 'P' || parent.tagName === 'DIV') && parent.childNodes.length === 1) {
@@ -295,7 +299,7 @@
 		return doc.body.innerHTML;
 	}
 
-	async function loadMarkdown(filePath: string, options: { navigate?: boolean; skipTabManagement?: boolean; activate?: boolean } = {}) {
+	async function loadMarkdown(filePath: string, options: { navigate?: boolean; skipTabManagement?: boolean; activate?: boolean; fragment?: string | null } = {}) {
 		showHome = false;
 		const normalizedFilePath = normalizeComparablePath(filePath);
 		try {
@@ -340,6 +344,9 @@
 			if (liveMode) invoke('watch_file', { path: filePath }).catch(console.error);
 
 			await tick();
+			if (options.fragment && shouldActivate && activeId === tabManager.activeTabId) {
+				scrollToFragment(options.fragment);
+			}
 			if (filePath) saveRecentFile(filePath);
 		} catch (error) {
 			console.error('Error loading file:', error);
@@ -470,6 +477,7 @@
 		localLinks.forEach((link) => {
 			const anchor = link as HTMLAnchorElement;
 			const localPath = anchor.dataset.localPath;
+			const localFragment = anchor.dataset.localFragment;
 			if (!localPath) return;
 
 			const oldListener = (anchor as any)._localClickHandler;
@@ -484,7 +492,7 @@
 				try {
 					const isMarkdown = ['.md', '.markdown', '.mdown', '.mkd'].some((ext) => localPath.toLowerCase().endsWith(ext));
 					if (isMarkdown) {
-						await loadMarkdown(localPath);
+						await loadMarkdown(localPath, { fragment: localFragment });
 					} else {
 						await invoke('open_file', { path: localPath });
 					}
@@ -730,6 +738,60 @@
 	function normalizeComparablePath(path: string) {
 		const normalized = path.replace(/\\/g, '/');
 		return normalized.match(/^[a-zA-Z]:\//) ? normalized.toLowerCase() : normalized;
+	}
+
+	function extractLinkFragment(rawPath: string | null) {
+		if (!rawPath) return null;
+		const hashIndex = rawPath.indexOf('#');
+		if (hashIndex === -1 || hashIndex === rawPath.length - 1) return null;
+
+		try {
+			return decodeURIComponent(rawPath.slice(hashIndex + 1));
+		} catch {
+			return rawPath.slice(hashIndex + 1);
+		}
+	}
+
+	function normalizeFragmentIdentifier(value: string) {
+		return value
+			.trim()
+			.toLowerCase()
+			.replace(/[%\s]+/g, '-')
+			.replace(/-+/g, '-');
+	}
+
+	function findFragmentTarget(fragment: string) {
+		if (!markdownBody) return null;
+
+		const exact = document.getElementById(fragment);
+		if (exact && markdownBody.contains(exact)) {
+			return exact.classList.contains('anchor') ? (exact.parentElement as HTMLElement | null) ?? exact : exact;
+		}
+
+		const normalizedFragment = normalizeFragmentIdentifier(fragment);
+		const candidates = Array.from(markdownBody.querySelectorAll('[id]')) as HTMLElement[];
+		for (const candidate of candidates) {
+			const candidateId = candidate.getAttribute('id');
+			if (!candidateId) continue;
+			if (normalizeFragmentIdentifier(candidateId) === normalizedFragment) {
+				return candidate.classList.contains('anchor') ? (candidate.parentElement as HTMLElement | null) ?? candidate : candidate;
+			}
+		}
+
+		return null;
+	}
+
+	function scrollToFragment(fragment: string) {
+		if (!markdownBody) return;
+
+		const target = findFragmentTarget(fragment);
+		if (!target) return;
+
+		const targetScroll = Math.max(0, target.offsetTop - 60);
+		if (Math.abs(markdownBody.scrollTop - targetScroll) > 5) {
+			isProgrammaticScroll = true;
+			markdownBody.scrollTop = targetScroll;
+		}
 	}
 
 	function resolvePath(basePath: string, relativePath: string) {
@@ -1262,15 +1324,23 @@
 		if (target?.tagName === 'A') {
 			const anchor = target as HTMLAnchorElement;
 			const localPath = anchor.dataset.localPath;
+			const localFragment = anchor.dataset.localFragment;
 			const rawHref = anchor.getAttribute('href');
 			if (!rawHref && !localPath) return;
 
-			if (rawHref?.startsWith('#')) return;
+			if (rawHref?.startsWith('#')) {
+				event.preventDefault();
+				const fragment = extractLinkFragment(rawHref);
+				if (fragment) {
+					scrollToFragment(fragment);
+				}
+				return;
+			}
 			const localMarkdownPath = localPath && ['.md', '.markdown', '.mdown', '.mkd'].some((ext) => localPath.toLowerCase().endsWith(ext));
 
 			if (localMarkdownPath) {
 				event.preventDefault();
-				await loadMarkdown(localPath);
+				await loadMarkdown(localPath, { fragment: localFragment });
 				return;
 			}
 

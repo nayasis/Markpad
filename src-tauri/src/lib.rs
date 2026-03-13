@@ -172,6 +172,7 @@ fn convert_markdown(content: &str) -> String {
     options.render.unsafe_ = true;
     options.render.hardbreaks = true;
     options.render.sourcepos = true;
+    options.extension.header_ids = Some(String::new());
 
     let html = markdown_to_html(&processed, &options);
     process_markdown_image_sizes(&html).into_owned()
