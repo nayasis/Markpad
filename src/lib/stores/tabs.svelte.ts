@@ -42,7 +42,7 @@ class TabManager {
 		return this.tabs.find((t) => t.id === this.activeTabId);
 	}
 
-	addTab(path: string, content: string = '') {
+	addTab(path: string, content: string = '', activate: boolean = true) {
 		const id = crypto.randomUUID();
 		const filename = path.split('\\').pop()?.split('/').pop() || 'Untitled';
 
@@ -66,7 +66,11 @@ class TabManager {
 			isScrollSynced: false
 		});
 
-		this.activeTabId = id;
+		if (activate) {
+			this.activeTabId = id;
+		}
+
+		return id;
 	}
 
 	addNewTab() {

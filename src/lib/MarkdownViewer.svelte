@@ -295,22 +295,31 @@
 		return doc.body.innerHTML;
 	}
 
-	async function loadMarkdown(filePath: string, options: { navigate?: boolean; skipTabManagement?: boolean } = {}) {
+	async function loadMarkdown(filePath: string, options: { navigate?: boolean; skipTabManagement?: boolean; activate?: boolean } = {}) {
 		showHome = false;
+		const normalizedFilePath = normalizeComparablePath(filePath);
 		try {
+			let targetTabId: string | null = null;
+			const shouldActivate = options.activate ?? true;
+
 			if (options.navigate && tabManager.activeTab) {
 				tabManager.navigate(tabManager.activeTab.id, filePath);
+				targetTabId = tabManager.activeTab.id;
 			} else if (!options.skipTabManagement) {
-				const existing = tabManager.tabs.find((t) => t.path === filePath);
+				const existing = tabManager.tabs.find((t) => normalizeComparablePath(t.path) === normalizedFilePath);
 				if (existing) {
-					tabManager.setActive(existing.id);
-				} else if (tabManager.activeTab && tabManager.activeTab.path === '') {
+					if (shouldActivate) {
+						tabManager.setActive(existing.id);
+					}
+					targetTabId = existing.id;
+				} else if (shouldActivate && tabManager.activeTab && tabManager.activeTab.path === '') {
 					tabManager.updateTabPath(tabManager.activeTab.id, filePath);
+					targetTabId = tabManager.activeTab.id;
 				} else {
-					tabManager.addTab(filePath);
+					targetTabId = tabManager.addTab(filePath, '', shouldActivate);
 				}
 			}
-			const activeId = tabManager.activeTabId;
+			const activeId = targetTabId ?? tabManager.activeTabId;
 			if (!activeId) return;
 
 			const ext = filePath.split('.').pop()?.toLowerCase();
@@ -337,7 +346,7 @@
 			const errStr = String(error);
 			if (errStr.includes('The system cannot find the file specified') || errStr.includes('No such file or directory')) {
 				deleteRecentFile(filePath);
-				if (tabManager.activeTab && tabManager.activeTab.path === filePath) {
+				if (tabManager.activeTab && normalizeComparablePath(tabManager.activeTab.path) === normalizedFilePath) {
 					tabManager.closeTab(tabManager.activeTab.id);
 				}
 			}
@@ -475,7 +484,7 @@
 				try {
 					const isMarkdown = ['.md', '.markdown', '.mdown', '.mkd'].some((ext) => localPath.toLowerCase().endsWith(ext));
 					if (isMarkdown) {
-						await loadMarkdown(localPath, { navigate: true });
+						await loadMarkdown(localPath);
 					} else {
 						await invoke('open_file', { path: localPath });
 					}
@@ -688,7 +697,8 @@
 	}
 
 	function saveRecentFile(path: string) {
-		let files = [...recentFiles].filter((f) => f !== path);
+		const normalizedPath = normalizeComparablePath(path);
+		let files = [...recentFiles].filter((f) => normalizeComparablePath(f) !== normalizedPath);
 		files.unshift(path);
 		recentFiles = files.slice(0, 9);
 		localStorage.setItem('recent-files', JSON.stringify(recentFiles));
@@ -706,14 +716,20 @@
 	}
 
 	function deleteRecentFile(path: string) {
-		recentFiles = recentFiles.filter((f) => f !== path);
+		const normalizedPath = normalizeComparablePath(path);
+		recentFiles = recentFiles.filter((f) => normalizeComparablePath(f) !== normalizedPath);
 		localStorage.setItem('recent-files', JSON.stringify(recentFiles));
 	}
 
 	function removeRecentFile(path: string, event: MouseEvent) {
 		event.stopPropagation();
 		deleteRecentFile(path);
-		if (currentFile === path) tabManager.closeTab(tabManager.activeTabId!);
+		if (normalizeComparablePath(currentFile) === normalizeComparablePath(path)) tabManager.closeTab(tabManager.activeTabId!);
+	}
+
+	function normalizeComparablePath(path: string) {
+		const normalized = path.replace(/\\/g, '/');
+		return normalized.match(/^[a-zA-Z]:\//) ? normalized.toLowerCase() : normalized;
 	}
 
 	function resolvePath(basePath: string, relativePath: string) {
@@ -1254,7 +1270,7 @@
 
 			if (localMarkdownPath) {
 				event.preventDefault();
-				await loadMarkdown(localPath, { navigate: true });
+				await loadMarkdown(localPath);
 				return;
 			}
 
