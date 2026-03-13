@@ -26,7 +26,7 @@ export type TabHistoryLocation = {
 class TabManager {
 	tabs = $state<Tab[]>([]);
 	activeTabId = $state<string | null>(null);
-	splitScrollSyncPreference = $state(false);
+	splitScrollSyncPreference = $state(true);
 	linkedTabHistory = $state<string[]>([]);
 	linkedTabHistoryIndex = $state(-1);
 
@@ -292,7 +292,9 @@ class TabManager {
 
 		tab.isSplit = enabled;
 		if (enabled) {
-			tab.isScrollSynced = this.splitScrollSyncPreference;
+			tab.isScrollSynced = true;
+			this.splitScrollSyncPreference = true;
+			this.saveSplitScrollSyncPreference();
 		} else {
 			this.splitScrollSyncPreference = tab.isScrollSynced;
 			this.saveSplitScrollSyncPreference();

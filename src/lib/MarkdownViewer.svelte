@@ -37,6 +37,14 @@
 		insertText: (text: string) => void;
 		focus: () => void;
 		syncScrollToLine: (line: number, ratio?: number) => void;
+		getScrollSyncState: () => ScrollSyncState | null;
+	};
+
+	type ScrollSyncState = {
+		line: number;
+		ratio: number;
+		kind: 'cursor' | 'viewport';
+		edge: 'top' | 'bottom' | null;
 	};
 
 	let showSettings = $state(false);
@@ -44,11 +52,14 @@
 	let recentFiles = $state<string[]>([]);
 	let isFocused = $state(true);
 	let markdownBody = $state<HTMLElement | null>(null);
-	let editorPane = $state<Pick<EditorHandle, 'syncScrollToLine'> | null>(null);
+	let editorPane = $state<Pick<EditorHandle, 'syncScrollToLine' | 'getScrollSyncState'> | null>(null);
 	let liveMode = $state(false);
 
 	let isDragging = $state(false);
 	let isProgrammaticScroll = false;
+	let lastScrollSyncSource = $state<'editor' | 'viewer'>('editor');
+	let pendingScrollSyncFrame = 0;
+	let previewImageResizeObserver: ResizeObserver | null = null;
 
 	// derived from tab manager
 	let activeTab = $derived(tabManager.activeTab);
@@ -394,6 +405,9 @@
 					// Create container and replace the <pre> block
 					const container = document.createElement('div');
 					container.className = 'mermaid-diagram';
+					if (preEl.dataset.sourcepos) {
+						container.dataset.sourcepos = preEl.dataset.sourcepos;
+					}
 					// Allow foreignObject for Mermaid text rendering
 					container.innerHTML = DOMPurify.sanitize(svg, {
 						ADD_TAGS: ['foreignObject'],
@@ -405,6 +419,9 @@
 					// Display error in place of diagram
 					const errorDiv = document.createElement('div');
 					errorDiv.className = 'mermaid-error';
+					if (preEl.dataset.sourcepos) {
+						errorDiv.dataset.sourcepos = preEl.dataset.sourcepos;
+					}
 					errorDiv.style.color = 'red';
 					errorDiv.style.padding = '1em';
 					errorDiv.textContent = `Error rendering Mermaid diagram: ${error}`;
@@ -433,6 +450,9 @@
 				const wrapper = existingWrapper ?? document.createElement('div');
 				if (!existingWrapper) {
 					wrapper.className = 'code-block-shell';
+					if (preEl.dataset.sourcepos) {
+						wrapper.dataset.sourcepos = preEl.dataset.sourcepos;
+					}
 					preEl.replaceWith(wrapper);
 					wrapper.appendChild(preEl);
 				}
@@ -515,10 +535,82 @@
 			anchor.addEventListener('click', handler);
 			(anchor as any)._localClickHandler = handler;
 		});
+
+		refreshPreviewImageObservers();
+		scheduleScrollSyncRefresh();
+	}
+
+	function scheduleScrollSyncRefresh(source: 'editor' | 'viewer' = lastScrollSyncSource) {
+		if (!isSplit || !isScrollSynced) return;
+
+		if (pendingScrollSyncFrame) {
+			cancelAnimationFrame(pendingScrollSyncFrame);
+		}
+
+		pendingScrollSyncFrame = requestAnimationFrame(() => {
+			pendingScrollSyncFrame = 0;
+
+			if (source === 'viewer' && markdownBody) {
+				syncEditorToPreviewScroll(markdownBody);
+				return;
+			}
+
+			syncPreviewToEditor();
+		});
+	}
+
+	function getSourceMappedElements(root: ParentNode): HTMLElement[] {
+		return Array.from(root.querySelectorAll('[data-sourcepos]'))
+			.filter((node): node is HTMLElement => node instanceof HTMLElement)
+			.filter((node) => node.offsetHeight > 0);
+	}
+
+	function refreshPreviewImageObservers() {
+		previewImageResizeObserver?.disconnect();
+		previewImageResizeObserver = null;
+
+		if (!markdownBody || typeof ResizeObserver === 'undefined') return;
+
+		const images = Array.from(markdownBody.querySelectorAll('img'));
+		if (!images.length) return;
+
+		previewImageResizeObserver = new ResizeObserver(() => {
+			scheduleScrollSyncRefresh();
+		});
+
+		for (const image of images) {
+			previewImageResizeObserver.observe(image);
+
+			if (!image.complete) {
+				image.addEventListener('load', () => scheduleScrollSyncRefresh(), { once: true });
+				image.addEventListener('error', () => scheduleScrollSyncRefresh(), { once: true });
+			}
+		}
 	}
 
 	$effect(() => {
 		if (htmlContent && markdownBody && !isEditing && hljs && renderMathInElement && mermaid) renderRichContent();
+	});
+
+	$effect(() => {
+		const body = markdownBody;
+		if (!body || typeof ResizeObserver === 'undefined') return;
+
+		const observer = new ResizeObserver(() => {
+			scheduleScrollSyncRefresh();
+		});
+		observer.observe(body);
+
+		return () => {
+			observer.disconnect();
+		};
+	});
+
+	$effect(() => {
+		if (!isSplit || !isScrollSynced || !markdownBody || !editorPane) return;
+
+		lastScrollSyncSource = 'editor';
+		scheduleScrollSyncRefresh('editor');
 	});
 
 	$effect(() => {
@@ -535,8 +627,8 @@
 					if (tab.anchorLine > 0) {
 						// Interpolated Restore
 						// Find element containing the anchor line
-						const children = Array.from(body.children) as HTMLElement[];
-						for (const el of children) {
+						const elements = getSourceMappedElements(body);
+						for (const el of elements) {
 							const sourcepos = el.dataset.sourcepos;
 							if (sourcepos) {
 								const [start, end] = sourcepos.split('-');
@@ -578,6 +670,15 @@
 	});
 
 	$effect(() => {
+		return () => {
+			if (pendingScrollSyncFrame) {
+				cancelAnimationFrame(pendingScrollSyncFrame);
+			}
+			previewImageResizeObserver?.disconnect();
+		};
+	});
+
+	$effect(() => {
 		if (markdownBody && !isEditing && tabManager.activeTabId) {
 			tick().then(() => {
 				markdownBody?.focus({ preventScroll: true });
@@ -585,11 +686,75 @@
 		}
 	});
 
+	function getPreviewScrollSyncState(target: HTMLElement): ScrollSyncState | null {
+		const anchorOffset = target.scrollTop + 60;
+		const viewportRatio = target.clientHeight > 0 ? Math.min(1, 60 / target.clientHeight) : 0;
+		const elements = getSourceMappedElements(target);
+		let fallback: ScrollSyncState | null = null;
+
+		for (const el of elements) {
+			const sourcepos = el.dataset.sourcepos;
+			if (!sourcepos) continue;
+
+			const [start, end] = sourcepos.split('-');
+			const startLine = parseInt(start.split(':')[0]);
+			const endLine = parseInt(end.split(':')[0]);
+
+			if (isNaN(startLine) || isNaN(endLine)) continue;
+
+			const top = el.offsetTop;
+			const bottom = top + el.offsetHeight;
+			const totalLines = endLine - startLine;
+			const relativeOffset = Math.max(0, Math.min(anchorOffset - top, el.offsetHeight));
+			const elementRatio = el.offsetHeight > 0 ? relativeOffset / el.offsetHeight : 0;
+			const estimatedLine = Math.max(startLine, Math.min(endLine, startLine + Math.round(totalLines * elementRatio)));
+			const state: ScrollSyncState = {
+				line: estimatedLine,
+				ratio: viewportRatio,
+				kind: 'viewport',
+				edge: null,
+			};
+
+			if (fallback === null || anchorOffset >= top) {
+				fallback = state;
+			}
+			if (top <= anchorOffset && bottom >= anchorOffset) {
+				return state;
+			}
+		}
+
+		return fallback;
+	}
+
+	function syncPreviewToEditor(scrollState: ScrollSyncState | null = editorPane?.getScrollSyncState() ?? null) {
+		if (!tabManager.activeTab?.isScrollSynced || !scrollState || !markdownBody) return;
+
+		lastScrollSyncSource = 'editor';
+
+		if (scrollState.kind === 'viewport' && scrollState.edge) {
+			const targetScroll = scrollState.edge === 'top'
+				? 0
+				: Math.max(0, markdownBody.scrollHeight - markdownBody.clientHeight);
+
+			if (Math.abs(markdownBody.scrollTop - targetScroll) > 5) {
+				isProgrammaticScroll = true;
+				markdownBody.scrollTop = targetScroll;
+			}
+
+			syncPreviewState(markdownBody);
+			return;
+		}
+
+		scrollToLine(scrollState.line, scrollState.ratio);
+	}
+
 	function scrollToLine(line: number, ratio: number = 0) {
 		if (!markdownBody) return;
 
-		const children = Array.from(markdownBody.children) as HTMLElement[];
-		for (const el of children) {
+		const elements = getSourceMappedElements(markdownBody);
+		let fallback: { el: HTMLElement; startLine: number; endLine: number } | null = null;
+
+		for (const el of elements) {
 			const sourcepos = el.dataset.sourcepos;
 			if (sourcepos) {
 				const [start, end] = sourcepos.split('-');
@@ -597,6 +762,10 @@
 				const endLine = parseInt(end.split(':')[0]);
 
 				if (!isNaN(startLine) && !isNaN(endLine)) {
+					if (line >= startLine) {
+						fallback = { el, startLine, endLine };
+					}
+
 					if (line >= startLine && line <= endLine) {
 						const totalLines = endLine - startLine;
 						let lineRatio = 0;
@@ -619,42 +788,36 @@
 				}
 			}
 		}
+
+		if (fallback) {
+			const { el, startLine, endLine } = fallback;
+			const totalLines = Math.max(0, endLine - startLine);
+			const clampedLine = Math.max(startLine, Math.min(endLine, line));
+			const lineRatio = totalLines > 0 ? (clampedLine - startLine) / totalLines : 0;
+			const elementTop = el.offsetTop + el.offsetHeight * lineRatio;
+			const targetScroll = elementTop - markdownBody.clientHeight * ratio;
+
+			if (Math.abs(markdownBody.scrollTop - targetScroll) > 5) {
+				isProgrammaticScroll = true;
+				markdownBody.scrollTop = Math.max(0, targetScroll);
+			}
+		}
 	}
 
-	function handleEditorScrollSync(line: number, ratio: number = 0) {
+	function handleEditorScrollSync(scrollState: ScrollSyncState) {
 		if (tabManager.activeTab?.isScrollSynced) {
-			scrollToLine(line, ratio);
+			syncPreviewToEditor(scrollState);
 		}
 	}
 
 	function syncEditorToPreviewScroll(target: HTMLElement) {
 		if (!tabManager.activeTab?.isScrollSynced || !editorPane) return;
 
-		const anchorOffset = target.scrollTop + 60;
-		const viewportRatio = target.clientHeight > 0 ? Math.min(1, 60 / target.clientHeight) : 0;
-		const children = Array.from(markdownBody?.children || []);
+		const scrollState = getPreviewScrollSyncState(target);
+		if (!scrollState) return;
 
-		for (const child of children) {
-			const el = child as HTMLElement;
-			if (el.offsetTop <= anchorOffset && el.offsetTop + el.offsetHeight > anchorOffset) {
-				const sourcepos = el.dataset.sourcepos;
-				if (!sourcepos) break;
-
-				const [start, end] = sourcepos.split('-');
-				const startLine = parseInt(start.split(':')[0]);
-				const endLine = parseInt(end.split(':')[0]);
-
-				if (!isNaN(startLine) && !isNaN(endLine)) {
-					const relativeOffset = anchorOffset - el.offsetTop;
-					const elementRatio = el.offsetHeight > 0 ? relativeOffset / el.offsetHeight : 0;
-					const totalLines = endLine - startLine;
-					const estimatedLine = startLine + Math.round(totalLines * elementRatio);
-
-					editorPane.syncScrollToLine(estimatedLine, viewportRatio);
-				}
-				break;
-			}
-		}
+		lastScrollSyncSource = 'viewer';
+		editorPane.syncScrollToLine(scrollState.line, scrollState.ratio);
 	}
 
 	function handleScroll(e: Event) {
@@ -678,33 +841,9 @@
 				tabManager.updateTabScrollPercentage(tabManager.activeTabId, percentage);
 			}
 
-			// Interpolated Anchor Calculation
-			const anchorOffset = target.scrollTop + 60;
-			const children = Array.from(markdownBody?.children || []);
-
-			for (const child of children) {
-				const el = child as HTMLElement;
-				// Check intersection
-				if (el.offsetTop <= anchorOffset && el.offsetTop + el.offsetHeight > anchorOffset) {
-					const sourcepos = el.dataset.sourcepos;
-					if (sourcepos) {
-						const [start, end] = sourcepos.split('-');
-						const startLine = parseInt(start.split(':')[0]);
-						const endLine = parseInt(end.split(':')[0]);
-
-						if (!isNaN(startLine) && !isNaN(endLine)) {
-							// Calculate relative position within element
-							const relativeOffset = anchorOffset - el.offsetTop;
-							const ratio = relativeOffset / el.offsetHeight;
-
-							const totalLines = endLine - startLine;
-							const estimatedLine = startLine + Math.round(totalLines * ratio);
-
-							tabManager.updateTabAnchorLine(tabManager.activeTabId, estimatedLine);
-						}
-					}
-					break;
-				}
+			const scrollState = getPreviewScrollSyncState(target);
+			if (scrollState) {
+				tabManager.updateTabAnchorLine(tabManager.activeTabId, scrollState.line);
 			}
 		}
 

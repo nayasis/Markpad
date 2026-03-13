@@ -16,6 +16,13 @@
 	import tsWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker';
 	import { initVimMode } from 'monaco-vim';
 
+	type ScrollSyncState = {
+		line: number;
+		ratio: number;
+		kind: 'cursor' | 'viewport';
+		edge: 'top' | 'bottom' | null;
+	};
+
 	let {
 		value = $bindable(),
 		language = 'markdown',
@@ -49,7 +56,7 @@
 		onnextTab?: () => void;
 		onprevTab?: () => void;
 		onundoClose?: () => void;
-		onscrollsync?: (line: number, ratio?: number) => void;
+		onscrollsync?: (state: ScrollSyncState) => void;
 		zoomLevel?: number;
 		theme?: 'system' | 'light' | 'dark';
 	}>();
@@ -755,34 +762,131 @@
 		if (Math.abs(editor.getScrollTop() - targetScroll) <= 5) return;
 
 		isApplyingExternalScroll = true;
-		editor.setScrollTop(targetScroll, monaco.editor.ScrollType.Smooth);
+		editor.setScrollTop(targetScroll, monaco.editor.ScrollType.Immediate);
 
 		requestAnimationFrame(() => {
 			isApplyingExternalScroll = false;
 		});
 	}
 
+	export function getScrollSyncState(): ScrollSyncState | null {
+		if (!editor) return null;
+
+		const ranges = editor.getVisibleRanges();
+		if (!ranges.length) return null;
+
+		const line = ranges[0].startLineNumber;
+		const layout = editor.getLayoutInfo();
+		if (layout.height <= 0) return null;
+
+		const lineTop = editor.getTopForLineNumber(line);
+		const scrollTop = editor.getScrollTop();
+		const ratio = (lineTop - scrollTop) / layout.height;
+
+		return {
+			line,
+			ratio,
+			kind: 'viewport',
+			edge: getScrollSyncEdge(),
+		};
+	}
+
+	function getCursorScrollSyncState(
+		position: monaco.Position | null = editor?.getPosition() ?? null,
+		mode: 'center' | 'viewport' = 'center'
+	): ScrollSyncState | null {
+		if (!editor || !position) return null;
+
+		const model = editor.getModel();
+		if (!model) return null;
+
+		const line = Math.max(1, Math.min(model.getLineCount(), position.lineNumber));
+		if (mode === 'center') {
+			// Cursor moves should actively bring the matching preview line near the
+			// middle of the viewport so click-to-line navigation feels direct.
+			return {
+				line,
+				ratio: 0.5,
+				kind: 'cursor',
+				edge: null,
+			};
+		}
+
+		const layout = editor.getLayoutInfo();
+		if (layout.height <= 0) return null;
+
+		const visiblePosition = editor.getScrolledVisiblePosition(position);
+		if (visiblePosition) {
+			const ratio = visiblePosition.top / layout.height;
+			return {
+				line,
+				ratio,
+				kind: 'viewport',
+				edge: getScrollSyncEdge(),
+			};
+		}
+
+		const lineTop = editor.getTopForLineNumber(line);
+		const scrollTop = editor.getScrollTop();
+		const ratio = (lineTop - scrollTop) / layout.height;
+
+		return {
+			line,
+			ratio,
+			kind: 'viewport',
+			edge: getScrollSyncEdge(),
+		};
+	}
+
+	function getScrollSyncEdge(): 'top' | 'bottom' | null {
+		if (!editor) return null;
+
+		const layout = editor.getLayoutInfo();
+		const maxScrollTop = Math.max(0, editor.getScrollHeight() - layout.height);
+		const scrollTop = editor.getScrollTop();
+		const epsilon = 4;
+
+		if (scrollTop <= epsilon) {
+			return 'top';
+		}
+
+		if (maxScrollTop - scrollTop <= epsilon) {
+			return 'bottom';
+		}
+
+		return null;
+	}
+
 	$effect(() => {
 		if (editor && onscrollsync) {
-			const emitSync = () => {
+			const emitViewportSync = () => {
 				if (isApplyingExternalScroll) return;
 
-				const position = editor.getPosition();
-				if (position) {
-					const top = editor.getTopForLineNumber(position.lineNumber);
-					const scrollTop = editor.getScrollTop();
-					const layout = editor.getLayoutInfo();
-					const ratio = (top - scrollTop) / layout.height;
-					onscrollsync?.(position.lineNumber, ratio);
-				}
+				const scrollState = getScrollSyncState();
+				if (!scrollState) return;
+
+				onscrollsync?.(scrollState);
+			};
+
+			const emitCursorSync = (position: monaco.Position | null, mode: 'center' | 'viewport' = 'center') => {
+				if (isApplyingExternalScroll) return;
+
+				const scrollState = getCursorScrollSyncState(position, mode);
+				if (!scrollState) return;
+
+				onscrollsync?.(scrollState);
 			};
 
 			const d1 = editor.onDidChangeCursorPosition((e) => {
-				emitSync();
+				emitCursorSync(e.position, 'center');
 			});
 			const d2 = editor.onDidScrollChange((e) => {
 				if (e.scrollTopChanged) {
-					emitSync();
+					if (editor.hasTextFocus()) {
+						emitCursorSync(editor.getPosition(), 'viewport');
+					} else {
+						emitViewportSync();
+					}
 				}
 			});
 			return () => {
