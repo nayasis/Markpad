@@ -1,7 +1,12 @@
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
+	import { onMount } from 'svelte';
 	import { tabManager } from '../stores/tabs.svelte.js';
 	import { settings } from '../stores/settings.svelte.js';
+	import { invoke } from '@tauri-apps/api/core';
+	import { message } from '@tauri-apps/plugin-dialog';
+	import { openUrl } from '@tauri-apps/plugin-opener';
+	import { hasFiles, hasImage, hasText, readFiles, readImageBinary, readText as readClipboardText } from 'tauri-plugin-clipboard-api';
+	import { encodeMarkdownPath } from '../attachment-path.js';
 
 	import * as monaco from 'monaco-editor';
 	import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
@@ -10,6 +15,13 @@
 	import htmlWorker from 'monaco-editor/esm/vs/language/html/html.worker?worker';
 	import tsWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker';
 	import { initVimMode } from 'monaco-vim';
+
+	type ScrollSyncState = {
+		line: number;
+		ratio: number;
+		kind: 'cursor' | 'viewport';
+		edge: 'top' | 'bottom' | null;
+	};
 
 	let {
 		value = $bindable(),
@@ -44,7 +56,7 @@
 		onnextTab?: () => void;
 		onprevTab?: () => void;
 		onundoClose?: () => void;
-		onscrollsync?: (line: number, ratio?: number) => void;
+		onscrollsync?: (state: ScrollSyncState) => void;
 		zoomLevel?: number;
 		theme?: 'system' | 'light' | 'dark';
 	}>();
@@ -60,6 +72,76 @@
 	let wordCount = $state(0);
 	let currentLanguage = $state('markdown');
 	const currentTabId = tabManager.activeTabId;
+
+	// Export method to insert text at cursor position
+	export function insertText(text: string) {
+		if (!editor) return;
+
+		const selection = editor.getSelection();
+		if (!selection) return;
+
+		editor.executeEdits('insert-text', [{
+			range: selection,
+			text: text,
+			forceMoveMarkers: true
+		}]);
+
+		editor.focus();
+	}
+
+	// Export method to focus editor
+	export function focus() {
+		if (editor) {
+			editor.focus();
+		}
+	}
+
+	function isImageFile(filename: string): boolean {
+		const ext = filename.split('.').pop()?.toLowerCase();
+		return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext || '');
+	}
+
+	function sanitizeFilename(filename: string): string {
+		const basename = filename.split(/[/\\]/).pop() || 'file';
+
+		const lastDotIndex = basename.lastIndexOf('.');
+		const name = lastDotIndex > 0 ? basename.slice(0, lastDotIndex) : basename;
+		const ext = lastDotIndex > 0 ? basename.slice(lastDotIndex) : '';
+
+		const cleanedName = name
+			.replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+			.replace(/[. ]+$/g, '')
+			.trim()
+			.substring(0, 200);
+		const cleanedExt = ext.replace(/[<>:"/\\|?*\x00-\x1F]/g, '');
+
+		if (cleanedName.length < 1) {
+			return `pasted_${Date.now()}${cleanedExt}`;
+		}
+
+		return cleanedName + cleanedExt;
+	}
+
+	function generateClipboardFilename(type: string, fallback = 'png'): string {
+		const ext = type.split('/')[1] || fallback;
+		const now = new Date();
+		const dateStr = now.toISOString().slice(0, 19).replace(/[-:T]/g, '').replace(/(\d{8})(\d{6})/, '$1_$2');
+		const randomStr = Math.random().toString(36).substring(2, 10);
+		return `${dateStr}_${randomStr}.${ext}`;
+	}
+
+	function toAttachmentMarkdown(relativePath: string, filename: string, isImage: boolean): string {
+		const markdownPath = encodeMarkdownPath(relativePath);
+		if (isImage) {
+			const altText = filename.replace(/\.[^/.]+$/, '') || 'image';
+			return `![${altText}](${markdownPath})`;
+		}
+		return `[${filename}](${markdownPath})`;
+	}
+
+	function isExternalLink(resource: monaco.Uri): boolean {
+		return ['http', 'https', 'mailto'].includes(resource.scheme);
+	}
 
 	self.MonacoEnvironment = {
 		getWorker: function (_moduleId: any, label: string) {
@@ -125,6 +207,23 @@
 			fontFamily: settings.editorFont,
 			wordBasedSuggestions: 'off',
 			quickSuggestions: false,
+		});
+
+		const linkOpenerDisposable = monaco.editor.registerLinkOpener({
+			async open(resource) {
+				if (!isExternalLink(resource)) {
+					return false;
+				}
+
+				try {
+					await openUrl(resource.toString());
+					return true;
+				} catch (error) {
+					console.error('Failed to open editor link:', error);
+					window.open(resource.toString(), '_blank', 'noopener,noreferrer');
+					return true;
+				}
+			},
 		});
 
 		if (tabManager.activeTab?.editorViewState) {
@@ -455,6 +554,84 @@
 			},
 		});
 
+		const handleNativeClipboardPaste = async () => {
+			try {
+				const documentPath = tabManager.activeTab?.path;
+
+				if (await hasFiles()) {
+					if (!documentPath) {
+						await message('Please save the document first before pasting files.', {
+							title: 'Cannot paste files',
+							kind: 'warning'
+						});
+						return;
+					}
+
+					const sourcePaths = await readFiles();
+					const markdownParts: string[] = [];
+
+					for (const sourcePath of sourcePaths) {
+						const originalFilename = sourcePath.split(/[/\\]/).pop() || 'file';
+						const filename = sanitizeFilename(originalFilename);
+						const isImage = isImageFile(filename);
+						const relativePath = await invoke<string>('copy_file_to_attachment', {
+							sourcePath,
+							documentPath,
+							targetFilename: filename,
+							isImage
+						});
+
+						markdownParts.push(toAttachmentMarkdown(relativePath, filename, isImage));
+					}
+
+					if (markdownParts.length > 0) {
+						insertText(markdownParts.join('\n'));
+						return;
+					}
+				}
+
+				if (await hasImage()) {
+					if (!documentPath) {
+						await message('Please save the document first before pasting images.', {
+							title: 'Cannot paste image',
+							kind: 'warning'
+						});
+						return;
+					}
+
+					const imageData = await readImageBinary('int_array') as number[];
+					const filename = generateClipboardFilename('image/png', 'png');
+					const relativePath = await invoke<string>('save_clipboard_file', {
+						documentPath,
+						fileData: imageData,
+						filename,
+						isImage: true
+					});
+
+					insertText(toAttachmentMarkdown(relativePath, filename, true));
+					return;
+				}
+
+				if (await hasText()) {
+					const text = await readClipboardText();
+					if (text) {
+						insertText(text);
+						return;
+					}
+				}
+			} catch (error) {
+				console.error('Native clipboard paste failed:', error);
+			}
+		};
+
+		editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, () => {
+			void handleNativeClipboardPaste();
+		});
+
+		editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.Insert, () => {
+			void handleNativeClipboardPaste();
+		});
+
 		const wheelListener = (e: WheelEvent) => {
 			if (e.ctrlKey || e.metaKey) {
 				e.preventDefault();
@@ -467,12 +644,87 @@
 			}
 		};
 
+		const saveClipboardAttachment = async (file: Blob, documentPath: string, filename: string, isImage: boolean) => {
+			try {
+				const arrayBuffer = await file.arrayBuffer();
+				const uint8Array = Array.from(new Uint8Array(arrayBuffer));
+				return await invoke<string>('save_clipboard_file', {
+					documentPath,
+					fileData: uint8Array,
+					filename,
+					isImage
+				});
+			} catch (error) {
+				console.error('Failed to save clipboard attachment:', error);
+				await message(String(error), {
+					title: 'Failed to paste attachment',
+					kind: 'error'
+				});
+				return null;
+			}
+		};
+
+		const handleClipboardFilesPaste = async (pasteEvent: monaco.editor.IPasteEvent) => {
+			const clipboardData = pasteEvent.clipboardEvent?.clipboardData;
+			if (!clipboardData) return;
+
+			const fileItems = Array.from(clipboardData.items).filter((item) => item.kind === 'file');
+			if (fileItems.length === 0) return;
+
+			const currentTab = tabManager.activeTab;
+			if (!currentTab?.path) {
+				await message('Please save the document first before pasting files.', {
+					title: 'Cannot paste files',
+					kind: 'warning'
+				});
+				return;
+			}
+
+			const markdownParts: string[] = [];
+			for (const item of fileItems) {
+				const file = item.getAsFile();
+				if (!file) continue;
+
+				const filename = file.name
+					? sanitizeFilename(file.name)
+					: generateClipboardFilename(file.type, 'bin');
+				const isImage = isImageFile(filename) || file.type.startsWith('image/');
+				const relativePath = await saveClipboardAttachment(file, currentTab.path, filename, isImage);
+				if (relativePath) {
+					markdownParts.push(toAttachmentMarkdown(relativePath, filename, isImage));
+				}
+			}
+
+			if (markdownParts.length === 0) return;
+
+			editor.executeEdits('clipboard-file-paste', [{
+				range: pasteEvent.range,
+				text: markdownParts.join('\n'),
+				forceMoveMarkers: true
+			}]);
+			editor.focus();
+		};
+
+		// Prevent browser's default dragover behavior
+		// NOTE: Don't prevent 'drop' event - Tauri needs it for file drop handling
+		const preventDefaultDragover = (e: DragEvent) => {
+			e.preventDefault();
+		};
+
+		const pasteDisposable = editor.onDidPaste((pasteEvent) => {
+			void handleClipboardFilesPaste(pasteEvent);
+		});
+
 		container.addEventListener('wheel', wheelListener, { capture: true });
+		container.addEventListener('dragover', preventDefaultDragover, true);
 
 		return () => {
 			// Clean up listeners
 			mediaQuery.removeEventListener('change', updateTheme);
+			pasteDisposable.dispose();
+			linkOpenerDisposable.dispose();
 			container.removeEventListener('wheel', wheelListener, { capture: true });
+			container.removeEventListener('dragover', preventDefaultDragover, true);
 
 			if (editor && currentTabId) {
 				const state = editor.saveViewState();
@@ -510,34 +762,131 @@
 		if (Math.abs(editor.getScrollTop() - targetScroll) <= 5) return;
 
 		isApplyingExternalScroll = true;
-		editor.setScrollTop(targetScroll, monaco.editor.ScrollType.Smooth);
+		editor.setScrollTop(targetScroll, monaco.editor.ScrollType.Immediate);
 
 		requestAnimationFrame(() => {
 			isApplyingExternalScroll = false;
 		});
 	}
 
+	export function getScrollSyncState(): ScrollSyncState | null {
+		if (!editor) return null;
+
+		const ranges = editor.getVisibleRanges();
+		if (!ranges.length) return null;
+
+		const line = ranges[0].startLineNumber;
+		const layout = editor.getLayoutInfo();
+		if (layout.height <= 0) return null;
+
+		const lineTop = editor.getTopForLineNumber(line);
+		const scrollTop = editor.getScrollTop();
+		const ratio = (lineTop - scrollTop) / layout.height;
+
+		return {
+			line,
+			ratio,
+			kind: 'viewport',
+			edge: getScrollSyncEdge(),
+		};
+	}
+
+	function getCursorScrollSyncState(
+		position: monaco.Position | null = editor?.getPosition() ?? null,
+		mode: 'center' | 'viewport' = 'center'
+	): ScrollSyncState | null {
+		if (!editor || !position) return null;
+
+		const model = editor.getModel();
+		if (!model) return null;
+
+		const line = Math.max(1, Math.min(model.getLineCount(), position.lineNumber));
+		if (mode === 'center') {
+			// Cursor moves should actively bring the matching preview line near the
+			// middle of the viewport so click-to-line navigation feels direct.
+			return {
+				line,
+				ratio: 0.5,
+				kind: 'cursor',
+				edge: null,
+			};
+		}
+
+		const layout = editor.getLayoutInfo();
+		if (layout.height <= 0) return null;
+
+		const visiblePosition = editor.getScrolledVisiblePosition(position);
+		if (visiblePosition) {
+			const ratio = visiblePosition.top / layout.height;
+			return {
+				line,
+				ratio,
+				kind: 'viewport',
+				edge: getScrollSyncEdge(),
+			};
+		}
+
+		const lineTop = editor.getTopForLineNumber(line);
+		const scrollTop = editor.getScrollTop();
+		const ratio = (lineTop - scrollTop) / layout.height;
+
+		return {
+			line,
+			ratio,
+			kind: 'viewport',
+			edge: getScrollSyncEdge(),
+		};
+	}
+
+	function getScrollSyncEdge(): 'top' | 'bottom' | null {
+		if (!editor) return null;
+
+		const layout = editor.getLayoutInfo();
+		const maxScrollTop = Math.max(0, editor.getScrollHeight() - layout.height);
+		const scrollTop = editor.getScrollTop();
+		const epsilon = 4;
+
+		if (scrollTop <= epsilon) {
+			return 'top';
+		}
+
+		if (maxScrollTop - scrollTop <= epsilon) {
+			return 'bottom';
+		}
+
+		return null;
+	}
+
 	$effect(() => {
 		if (editor && onscrollsync) {
-			const emitSync = () => {
+			const emitViewportSync = () => {
 				if (isApplyingExternalScroll) return;
 
-				const position = editor.getPosition();
-				if (position) {
-					const top = editor.getTopForLineNumber(position.lineNumber);
-					const scrollTop = editor.getScrollTop();
-					const layout = editor.getLayoutInfo();
-					const ratio = (top - scrollTop) / layout.height;
-					onscrollsync?.(position.lineNumber, ratio);
-				}
+				const scrollState = getScrollSyncState();
+				if (!scrollState) return;
+
+				onscrollsync?.(scrollState);
+			};
+
+			const emitCursorSync = (position: monaco.Position | null, mode: 'center' | 'viewport' = 'center') => {
+				if (isApplyingExternalScroll) return;
+
+				const scrollState = getCursorScrollSyncState(position, mode);
+				if (!scrollState) return;
+
+				onscrollsync?.(scrollState);
 			};
 
 			const d1 = editor.onDidChangeCursorPosition((e) => {
-				emitSync();
+				emitCursorSync(e.position, 'center');
 			});
 			const d2 = editor.onDidScrollChange((e) => {
 				if (e.scrollTopChanged) {
-					emitSync();
+					if (editor.hasTextFocus()) {
+						emitCursorSync(editor.getPosition(), 'viewport');
+					} else {
+						emitViewportSync();
+					}
 				}
 			});
 			return () => {

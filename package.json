@@ -23,7 +23,8 @@
     "katex": "^0.16.27",
     "mermaid": "^11.12.2",
     "monaco-editor": "^0.55.1",
-    "monaco-vim": "^0.4.4"
+    "monaco-vim": "^0.4.4",
+    "tauri-plugin-clipboard-api": "^2.1.11"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.6",

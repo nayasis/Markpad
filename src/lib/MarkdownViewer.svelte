@@ -6,6 +6,7 @@
 	import { fly } from 'svelte/transition';
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { open, save, ask } from '@tauri-apps/plugin-dialog';
+	import { writeImageBinary } from 'tauri-plugin-clipboard-api';
 	import Installer from './Installer.svelte';
 	import Uninstaller from './Uninstaller.svelte';
 	import Settings from './components/Settings.svelte';
@@ -20,6 +21,7 @@
 	import HomePage from './components/HomePage.svelte';
 	import { tabManager } from './stores/tabs.svelte.js';
 	import { settings } from './stores/settings.svelte.js';
+	import { decodeMarkdownPath, encodeMarkdownPath } from './attachment-path.js';
 
 	// syntax highlighting & latex
 	let hljs: any = $state(null);
@@ -31,22 +33,43 @@
 
 	let mode = $state<'loading' | 'app' | 'installer' | 'uninstall'>('loading');
 
+	type EditorHandle = {
+		insertText: (text: string) => void;
+		focus: () => void;
+		syncScrollToLine: (line: number, ratio?: number) => void;
+		getScrollSyncState: () => ScrollSyncState | null;
+	};
+
+	type ScrollSyncState = {
+		line: number;
+		ratio: number;
+		kind: 'cursor' | 'viewport';
+		edge: 'top' | 'bottom' | null;
+	};
+
+	type ViewMode = 'viewer' | 'edit' | 'split';
+
 	let showSettings = $state(false);
 
 	let recentFiles = $state<string[]>([]);
 	let isFocused = $state(true);
 	let markdownBody = $state<HTMLElement | null>(null);
-	let editorPane = $state<{ syncScrollToLine: (line: number, ratio?: number) => void } | null>(null);
+	let editorPane = $state<Pick<EditorHandle, 'syncScrollToLine' | 'getScrollSyncState'> | null>(null);
 	let liveMode = $state(false);
 
 	let isDragging = $state(false);
 	let isProgrammaticScroll = false;
+	let lastScrollSyncSource = $state<'editor' | 'viewer'>('editor');
+	let pendingScrollSyncFrame = 0;
+	let previewImageResizeObserver: ResizeObserver | null = null;
+	let viewMode = $state<ViewMode>((typeof localStorage !== 'undefined' ? (localStorage.getItem('editor.viewMode') as ViewMode | null) : null) ?? 'viewer');
 
 	// derived from tab manager
 	let activeTab = $derived(tabManager.activeTab);
-	let isEditing = $derived(activeTab?.isEditing ?? false);
+	let activeTabSupportsPreview = $derived(tabSupportsPreview(activeTab));
+	let isEditing = $derived(!activeTabSupportsPreview || viewMode === 'edit');
 	let rawContent = $derived(activeTab?.rawContent ?? '');
-	let isSplit = $derived(activeTab?.isSplit ?? false);
+	let isSplit = $derived(activeTabSupportsPreview && viewMode === 'split');
 
 	// derived from tab manager
 	let currentFile = $derived(tabManager.activeTab?.path ?? '');
@@ -60,9 +83,46 @@
 
 	let showHome = $state(false);
 	let isFullWidth = $state(localStorage.getItem('isFullWidth') === 'true');
+	let editorComponent = $state<EditorHandle | null>(null);
+
+	$effect(() => {
+		editorPane = editorComponent;
+	});
 
 	$effect(() => {
 		localStorage.setItem('isFullWidth', String(isFullWidth));
+	});
+
+	$effect(() => {
+		localStorage.setItem('editor.viewMode', viewMode);
+	});
+
+	$effect(() => {
+		const activeTabId = tabManager.activeTabId;
+		const editorVisible = isEditing || isSplit;
+
+		if (!activeTabId || !editorVisible) return;
+
+		untrack(() => {
+			const tab = tabManager.tabs.find((candidate) => candidate.id === activeTabId);
+			if (tab) {
+				void ensureEditorContentLoaded(tab);
+			}
+		});
+	});
+
+	$effect(() => {
+		const activeTabId = tabManager.activeTabId;
+		const viewerVisible = !isEditing && !isSplit;
+
+		if (!activeTabId || !viewerVisible) return;
+
+		untrack(() => {
+			const tab = tabManager.tabs.find((candidate) => candidate.id === activeTabId);
+			if (tab?.isDirty && tabSupportsPreview(tab)) {
+				void renderPreviewFromRaw(tab);
+			}
+		});
 	});
 
 	// Theme State
@@ -190,8 +250,11 @@
 			const src = img.getAttribute('src');
 			let finalSrc = src;
 			if (src && !src.startsWith('http') && !src.startsWith('data:')) {
-				finalSrc = convertFileSrc(resolvePath(filePath, src));
+				const decodedSrc = decodeMarkdownPath(src);
+				const resolvedPath = resolvePath(filePath, decodedSrc);
+				finalSrc = convertFileSrc(resolvedPath);
 				img.setAttribute('src', finalSrc);
+				img.setAttribute('data-local-path', resolvedPath);
 			}
 
 			if (src) {
@@ -204,6 +267,7 @@
 					media.setAttribute('controls', '');
 					media.setAttribute('src', finalSrc || '');
 					media.style.maxWidth = '100%';
+					if (img.dataset.localPath) media.setAttribute('data-local-path', img.dataset.localPath);
 
 					// Copy attributes
 					if (img.hasAttribute('width')) media.setAttribute('width', img.getAttribute('width')!);
@@ -225,6 +289,14 @@
 		// convert youtube links to embeds
 		for (const a of doc.querySelectorAll('a')) {
 			const href = a.getAttribute('href');
+			const resolvedPath = resolveLocalTargetPath(href, filePath);
+			if (resolvedPath) {
+				a.setAttribute('data-local-path', resolvedPath);
+			}
+			const fragment = extractLinkFragment(href);
+			if (fragment) {
+				a.setAttribute('data-local-fragment', fragment);
+			}
 			if (href && isYoutubeLink(href)) {
 				const parent = a.parentElement;
 				if (parent && (parent.tagName === 'P' || parent.tagName === 'DIV') && parent.childNodes.length === 1) {
@@ -274,22 +346,31 @@
 		return doc.body.innerHTML;
 	}
 
-	async function loadMarkdown(filePath: string, options: { navigate?: boolean; skipTabManagement?: boolean } = {}) {
+	async function loadMarkdown(filePath: string, options: { navigate?: boolean; skipTabManagement?: boolean; activate?: boolean; fragment?: string | null; linkedFromTabId?: string | null } = {}) {
 		showHome = false;
+		const normalizedFilePath = normalizeComparablePath(filePath);
 		try {
+			let targetTabId: string | null = null;
+			const shouldActivate = options.activate ?? true;
+
 			if (options.navigate && tabManager.activeTab) {
 				tabManager.navigate(tabManager.activeTab.id, filePath);
+				targetTabId = tabManager.activeTab.id;
 			} else if (!options.skipTabManagement) {
-				const existing = tabManager.tabs.find((t) => t.path === filePath);
+				const existing = tabManager.tabs.find((t) => normalizeComparablePath(t.path) === normalizedFilePath);
 				if (existing) {
-					tabManager.setActive(existing.id);
-				} else if (tabManager.activeTab && tabManager.activeTab.path === '') {
+					if (shouldActivate) {
+						tabManager.setActive(existing.id);
+					}
+					targetTabId = existing.id;
+				} else if (shouldActivate && tabManager.activeTab && tabManager.activeTab.path === '') {
 					tabManager.updateTabPath(tabManager.activeTab.id, filePath);
+					targetTabId = tabManager.activeTab.id;
 				} else {
-					tabManager.addTab(filePath);
+					targetTabId = tabManager.addTab(filePath, '', shouldActivate);
 				}
 			}
-			const activeId = tabManager.activeTabId;
+			const activeId = targetTabId ?? tabManager.activeTabId;
 			if (!activeId) return;
 
 			const ext = filePath.split('.').pop()?.toLowerCase();
@@ -297,12 +378,10 @@
 			const tab = tabManager.tabs.find((t) => t.id === activeId);
 
 			if (isMarkdown) {
-				if (tab) tab.isEditing = false;
 				const html = (await invoke('open_markdown', { path: filePath })) as string;
 				const processedInfo = processMarkdownHtml(html, filePath);
 				tabManager.updateTabContent(activeId, processedInfo);
 			} else {
-				if (tab) tab.isEditing = true;
 				const content = (await invoke('read_file_content', { path: filePath })) as string;
 				tabManager.setTabRawContent(activeId, content);
 			}
@@ -310,13 +389,25 @@
 			if (liveMode) invoke('watch_file', { path: filePath }).catch(console.error);
 
 			await tick();
+			if (options.linkedFromTabId && options.linkedFromTabId !== activeId) {
+				tabManager.recordLinkedTabNavigation(options.linkedFromTabId, activeId);
+			}
+			if (options.fragment && !options.skipTabManagement) {
+				tabManager.navigate(activeId, filePath, options.fragment);
+			}
+			if (options.fragment && shouldActivate && activeId === tabManager.activeTabId) {
+				scrollToFragment(options.fragment);
+			}
+			if (shouldActivate && (viewMode === 'edit' || viewMode === 'split') && tab) {
+				void ensureEditorContentLoaded(tab);
+			}
 			if (filePath) saveRecentFile(filePath);
 		} catch (error) {
 			console.error('Error loading file:', error);
 			const errStr = String(error);
 			if (errStr.includes('The system cannot find the file specified') || errStr.includes('No such file or directory')) {
 				deleteRecentFile(filePath);
-				if (tabManager.activeTab && tabManager.activeTab.path === filePath) {
+				if (tabManager.activeTab && normalizeComparablePath(tabManager.activeTab.path) === normalizedFilePath) {
 					tabManager.closeTab(tabManager.activeTab.id);
 				}
 			}
@@ -351,6 +442,9 @@
 					// Create container and replace the <pre> block
 					const container = document.createElement('div');
 					container.className = 'mermaid-diagram';
+					if (preEl.dataset.sourcepos) {
+						container.dataset.sourcepos = preEl.dataset.sourcepos;
+					}
 					// Allow foreignObject for Mermaid text rendering
 					container.innerHTML = DOMPurify.sanitize(svg, {
 						ADD_TAGS: ['foreignObject'],
@@ -362,6 +456,9 @@
 					// Display error in place of diagram
 					const errorDiv = document.createElement('div');
 					errorDiv.className = 'mermaid-error';
+					if (preEl.dataset.sourcepos) {
+						errorDiv.dataset.sourcepos = preEl.dataset.sourcepos;
+					}
 					errorDiv.style.color = 'red';
 					errorDiv.style.padding = '1em';
 					errorDiv.textContent = `Error rendering Mermaid diagram: ${error}`;
@@ -390,6 +487,9 @@
 				const wrapper = existingWrapper ?? document.createElement('div');
 				if (!existingWrapper) {
 					wrapper.className = 'code-block-shell';
+					if (preEl.dataset.sourcepos) {
+						wrapper.dataset.sourcepos = preEl.dataset.sourcepos;
+					}
 					preEl.replaceWith(wrapper);
 					wrapper.appendChild(preEl);
 				}
@@ -434,10 +534,120 @@
 			],
 			throwOnError: false,
 		});
+
+		// Handle local links directly on the anchor so browser navigation never wins.
+		const localLinks = markdownBody.querySelectorAll('a[data-local-path]');
+		localLinks.forEach((link) => {
+			const anchor = link as HTMLAnchorElement;
+			const localPath = anchor.dataset.localPath;
+			const localFragment = anchor.dataset.localFragment;
+			if (!localPath) return;
+
+			const oldListener = (anchor as any)._localClickHandler;
+			if (oldListener) {
+				anchor.removeEventListener('click', oldListener);
+			}
+
+			const handler = async (e: MouseEvent) => {
+				e.preventDefault();
+				e.stopPropagation();
+				const linkedFromTabId = tabManager.activeTabId;
+
+				try {
+					const isMarkdown = ['.md', '.markdown', '.mdown', '.mkd'].some((ext) => localPath.toLowerCase().endsWith(ext));
+					if (isMarkdown) {
+						await loadMarkdown(localPath, { fragment: localFragment, linkedFromTabId });
+					} else {
+						await invoke('open_file', { path: localPath });
+					}
+				} catch (error) {
+					console.error('Failed to open local link:', error);
+					await askCustom(
+						`Failed to open file: ${error}`,
+						{ title: 'Error', kind: 'error' }
+					);
+				}
+			};
+
+			anchor.addEventListener('click', handler);
+			(anchor as any)._localClickHandler = handler;
+		});
+
+		refreshPreviewImageObservers();
+		scheduleScrollSyncRefresh();
+	}
+
+	function scheduleScrollSyncRefresh(source: 'editor' | 'viewer' = lastScrollSyncSource) {
+		if (!isSplit || !isScrollSynced) return;
+
+		if (pendingScrollSyncFrame) {
+			cancelAnimationFrame(pendingScrollSyncFrame);
+		}
+
+		pendingScrollSyncFrame = requestAnimationFrame(() => {
+			pendingScrollSyncFrame = 0;
+
+			if (source === 'viewer' && markdownBody) {
+				syncEditorToPreviewScroll(markdownBody);
+				return;
+			}
+
+			syncPreviewToEditor();
+		});
+	}
+
+	function getSourceMappedElements(root: ParentNode): HTMLElement[] {
+		return Array.from(root.querySelectorAll('[data-sourcepos]'))
+			.filter((node): node is HTMLElement => node instanceof HTMLElement)
+			.filter((node) => node.offsetHeight > 0);
+	}
+
+	function refreshPreviewImageObservers() {
+		previewImageResizeObserver?.disconnect();
+		previewImageResizeObserver = null;
+
+		if (!markdownBody || typeof ResizeObserver === 'undefined') return;
+
+		const images = Array.from(markdownBody.querySelectorAll('img'));
+		if (!images.length) return;
+
+		previewImageResizeObserver = new ResizeObserver(() => {
+			scheduleScrollSyncRefresh();
+		});
+
+		for (const image of images) {
+			previewImageResizeObserver.observe(image);
+
+			if (!image.complete) {
+				image.addEventListener('load', () => scheduleScrollSyncRefresh(), { once: true });
+				image.addEventListener('error', () => scheduleScrollSyncRefresh(), { once: true });
+			}
+		}
 	}
 
 	$effect(() => {
 		if (htmlContent && markdownBody && !isEditing && hljs && renderMathInElement && mermaid) renderRichContent();
+	});
+
+	$effect(() => {
+		const body = markdownBody;
+		if (!body || typeof ResizeObserver === 'undefined') return;
+
+		const observer = new ResizeObserver(() => {
+			scheduleScrollSyncRefresh();
+		});
+		observer.observe(body);
+
+		return () => {
+			observer.disconnect();
+		};
+	});
+
+	$effect(() => {
+		if (!isSplit || !isScrollSynced || !markdownBody || !editorPane) return;
+
+		lastScrollSyncSource = 'editor';
+		scheduleScrollSyncRefresh('editor');
 	});
 
 	$effect(() => {
@@ -454,8 +664,8 @@
 					if (tab.anchorLine > 0) {
 						// Interpolated Restore
 						// Find element containing the anchor line
-						const children = Array.from(body.children) as HTMLElement[];
-						for (const el of children) {
+						const elements = getSourceMappedElements(body);
+						for (const el of elements) {
 							const sourcepos = el.dataset.sourcepos;
 							if (sourcepos) {
 								const [start, end] = sourcepos.split('-');
@@ -497,6 +707,15 @@
 	});
 
 	$effect(() => {
+		return () => {
+			if (pendingScrollSyncFrame) {
+				cancelAnimationFrame(pendingScrollSyncFrame);
+			}
+			previewImageResizeObserver?.disconnect();
+		};
+	});
+
+	$effect(() => {
 		if (markdownBody && !isEditing && tabManager.activeTabId) {
 			tick().then(() => {
 				markdownBody?.focus({ preventScroll: true });
@@ -504,11 +723,75 @@
 		}
 	});
 
+	function getPreviewScrollSyncState(target: HTMLElement): ScrollSyncState | null {
+		const anchorOffset = target.scrollTop + 60;
+		const viewportRatio = target.clientHeight > 0 ? Math.min(1, 60 / target.clientHeight) : 0;
+		const elements = getSourceMappedElements(target);
+		let fallback: ScrollSyncState | null = null;
+
+		for (const el of elements) {
+			const sourcepos = el.dataset.sourcepos;
+			if (!sourcepos) continue;
+
+			const [start, end] = sourcepos.split('-');
+			const startLine = parseInt(start.split(':')[0]);
+			const endLine = parseInt(end.split(':')[0]);
+
+			if (isNaN(startLine) || isNaN(endLine)) continue;
+
+			const top = el.offsetTop;
+			const bottom = top + el.offsetHeight;
+			const totalLines = endLine - startLine;
+			const relativeOffset = Math.max(0, Math.min(anchorOffset - top, el.offsetHeight));
+			const elementRatio = el.offsetHeight > 0 ? relativeOffset / el.offsetHeight : 0;
+			const estimatedLine = Math.max(startLine, Math.min(endLine, startLine + Math.round(totalLines * elementRatio)));
+			const state: ScrollSyncState = {
+				line: estimatedLine,
+				ratio: viewportRatio,
+				kind: 'viewport',
+				edge: null,
+			};
+
+			if (fallback === null || anchorOffset >= top) {
+				fallback = state;
+			}
+			if (top <= anchorOffset && bottom >= anchorOffset) {
+				return state;
+			}
+		}
+
+		return fallback;
+	}
+
+	function syncPreviewToEditor(scrollState: ScrollSyncState | null = editorPane?.getScrollSyncState() ?? null) {
+		if (!tabManager.activeTab?.isScrollSynced || !scrollState || !markdownBody) return;
+
+		lastScrollSyncSource = 'editor';
+
+		if (scrollState.kind === 'viewport' && scrollState.edge) {
+			const targetScroll = scrollState.edge === 'top'
+				? 0
+				: Math.max(0, markdownBody.scrollHeight - markdownBody.clientHeight);
+
+			if (Math.abs(markdownBody.scrollTop - targetScroll) > 5) {
+				isProgrammaticScroll = true;
+				markdownBody.scrollTop = targetScroll;
+			}
+
+			syncPreviewState(markdownBody);
+			return;
+		}
+
+		scrollToLine(scrollState.line, scrollState.ratio);
+	}
+
 	function scrollToLine(line: number, ratio: number = 0) {
 		if (!markdownBody) return;
 
-		const children = Array.from(markdownBody.children) as HTMLElement[];
-		for (const el of children) {
+		const elements = getSourceMappedElements(markdownBody);
+		let fallback: { el: HTMLElement; startLine: number; endLine: number } | null = null;
+
+		for (const el of elements) {
 			const sourcepos = el.dataset.sourcepos;
 			if (sourcepos) {
 				const [start, end] = sourcepos.split('-');
@@ -516,6 +799,10 @@
 				const endLine = parseInt(end.split(':')[0]);
 
 				if (!isNaN(startLine) && !isNaN(endLine)) {
+					if (line >= startLine) {
+						fallback = { el, startLine, endLine };
+					}
+
 					if (line >= startLine && line <= endLine) {
 						const totalLines = endLine - startLine;
 						let lineRatio = 0;
@@ -538,41 +825,55 @@
 				}
 			}
 		}
+
+		if (fallback) {
+			const { el, startLine, endLine } = fallback;
+			const totalLines = Math.max(0, endLine - startLine);
+			const clampedLine = Math.max(startLine, Math.min(endLine, line));
+			const lineRatio = totalLines > 0 ? (clampedLine - startLine) / totalLines : 0;
+			const elementTop = el.offsetTop + el.offsetHeight * lineRatio;
+			const targetScroll = elementTop - markdownBody.clientHeight * ratio;
+
+			if (Math.abs(markdownBody.scrollTop - targetScroll) > 5) {
+				isProgrammaticScroll = true;
+				markdownBody.scrollTop = Math.max(0, targetScroll);
+			}
+		}
 	}
 
-	function handleEditorScrollSync(line: number, ratio: number = 0) {
+	function handleEditorScrollSync(scrollState: ScrollSyncState) {
 		if (tabManager.activeTab?.isScrollSynced) {
-			scrollToLine(line, ratio);
+			syncPreviewToEditor(scrollState);
 		}
 	}
 
 	function syncEditorToPreviewScroll(target: HTMLElement) {
 		if (!tabManager.activeTab?.isScrollSynced || !editorPane) return;
 
-		const anchorOffset = target.scrollTop + 60;
-		const viewportRatio = target.clientHeight > 0 ? Math.min(1, 60 / target.clientHeight) : 0;
-		const children = Array.from(markdownBody?.children || []);
+		const scrollState = getPreviewScrollSyncState(target);
+		if (!scrollState) return;
 
-		for (const child of children) {
-			const el = child as HTMLElement;
-			if (el.offsetTop <= anchorOffset && el.offsetTop + el.offsetHeight > anchorOffset) {
-				const sourcepos = el.dataset.sourcepos;
-				if (!sourcepos) break;
+		lastScrollSyncSource = 'viewer';
+		editorPane.syncScrollToLine(scrollState.line, scrollState.ratio);
+	}
 
-				const [start, end] = sourcepos.split('-');
-				const startLine = parseInt(start.split(':')[0]);
-				const endLine = parseInt(end.split(':')[0]);
+	function syncPreviewState(target: HTMLElement, syncEditor = false) {
+		if (tabManager.activeTabId) {
+			tabManager.updateTabScroll(tabManager.activeTabId, target.scrollTop);
 
-				if (!isNaN(startLine) && !isNaN(endLine)) {
-					const relativeOffset = anchorOffset - el.offsetTop;
-					const elementRatio = el.offsetHeight > 0 ? relativeOffset / el.offsetHeight : 0;
-					const totalLines = endLine - startLine;
-					const estimatedLine = startLine + Math.round(totalLines * elementRatio);
-
-					editorPane.syncScrollToLine(estimatedLine, viewportRatio);
-				}
-				break;
+			if (target.scrollHeight > target.clientHeight) {
+				const percentage = target.scrollTop / (target.scrollHeight - target.clientHeight);
+				tabManager.updateTabScrollPercentage(tabManager.activeTabId, percentage);
+			} else {
+				tabManager.updateTabScrollPercentage(tabManager.activeTabId, 0);
 			}
+
+			const scrollState = getPreviewScrollSyncState(target);
+			tabManager.updateTabAnchorLine(tabManager.activeTabId, scrollState?.line ?? 0);
+		}
+
+		if (syncEditor) {
+			syncEditorToPreviewScroll(target);
 		}
 	}
 
@@ -581,60 +882,102 @@
 
 		if (isProgrammaticScroll) {
 			isProgrammaticScroll = false;
-			if (tabManager.activeTabId) {
-				tabManager.updateTabScroll(tabManager.activeTabId, target.scrollTop);
+			syncPreviewState(target);
+			return;
+		}
+
+		syncPreviewState(target, true);
+	}
+
+	function saveRecentFile(path: string) {
+		const normalizedPath = normalizeComparablePath(path);
+		let files = [...recentFiles].filter((f) => normalizeComparablePath(f) !== normalizedPath);
+		files.unshift(path);
+		recentFiles = files.slice(0, 9);
+		localStorage.setItem('recent-files', JSON.stringify(recentFiles));
+	}
+
+	function tabSupportsPreview(tab: typeof tabManager.activeTab) {
+		if (!tab || tab.path === 'HOME') return false;
+		if (tab.path === '') return true;
+
+		const ext = tab.path.split('.').pop()?.toLowerCase() || '';
+		return ['md', 'markdown', 'mdown', 'mkd'].includes(ext);
+	}
+
+	async function ensureEditorContentLoaded(tab = tabManager.activeTab) {
+		if (!tab || !tab.path || tab.path === 'HOME' || tab.isDirty) return;
+
+		try {
+			const content = (await invoke('read_file_content', { path: tab.path })) as string;
+			if (tabManager.activeTabId !== tab.id) return;
+
+			tab.rawContent = content;
+			tab.originalContent = content;
+			tab.isDirty = false;
+		} catch (error) {
+			console.error('Failed to load file for editing', error);
+		}
+	}
+
+	async function renderPreviewFromRaw(tab = tabManager.activeTab) {
+		if (!tab || !tabSupportsPreview(tab)) return;
+
+		try {
+			const html = (await invoke('render_markdown', { content: tab.rawContent })) as string;
+			const processedInfo = processMarkdownHtml(html, tab.path);
+			tabManager.updateTabContent(tab.id, processedInfo);
+		} catch (error) {
+			console.error('Failed to render markdown preview', error);
+		}
+	}
+
+	async function setViewMode(nextMode: ViewMode, autoSave = false) {
+		const tab = tabManager.activeTab;
+		if (!tab) return;
+
+		const currentMode: ViewMode = isSplit ? 'split' : isEditing ? 'edit' : 'viewer';
+		if (currentMode === nextMode) return;
+
+		if (nextMode === 'viewer') {
+			if ((isEditing || isSplit) && tab.isDirty && tab.path !== '') {
+				if (autoSave) {
+					const success = await saveContent();
+					if (!success) return;
+				} else {
+					const response = await askCustom('You have unsaved changes. Do you want to save them before returning to view mode?', {
+						title: 'Unsaved Changes',
+						kind: 'warning',
+						showSave: true,
+					});
+
+					if (response === 'cancel') return;
+					if (response === 'save') {
+						const success = await saveContent();
+						if (!success) return;
+					} else if (response === 'discard') {
+						tab.rawContent = tab.originalContent;
+					}
+				}
+			}
+
+			viewMode = 'viewer';
+			if (tab.path !== '') {
+				tab.isDirty = false;
+				await loadMarkdown(tab.path, { skipTabManagement: true, activate: false });
+			} else {
+				await renderPreviewFromRaw(tab);
 			}
 			return;
 		}
 
-		if (tabManager.activeTabId) {
-			// Update raw scroll pos
-			tabManager.updateTabScroll(tabManager.activeTabId, target.scrollTop);
+		await ensureEditorContentLoaded(tab);
+		viewMode = nextMode;
 
-			// Percentage fallback
-			if (target.scrollHeight > target.clientHeight) {
-				const percentage = target.scrollTop / (target.scrollHeight - target.clientHeight);
-				tabManager.updateTabScrollPercentage(tabManager.activeTabId, percentage);
-			}
-
-			// Interpolated Anchor Calculation
-			const anchorOffset = target.scrollTop + 60;
-			const children = Array.from(markdownBody?.children || []);
-
-			for (const child of children) {
-				const el = child as HTMLElement;
-				// Check intersection
-				if (el.offsetTop <= anchorOffset && el.offsetTop + el.offsetHeight > anchorOffset) {
-					const sourcepos = el.dataset.sourcepos;
-					if (sourcepos) {
-						const [start, end] = sourcepos.split('-');
-						const startLine = parseInt(start.split(':')[0]);
-						const endLine = parseInt(end.split(':')[0]);
-
-						if (!isNaN(startLine) && !isNaN(endLine)) {
-							// Calculate relative position within element
-							const relativeOffset = anchorOffset - el.offsetTop;
-							const ratio = relativeOffset / el.offsetHeight;
-
-							const totalLines = endLine - startLine;
-							const estimatedLine = startLine + Math.round(totalLines * ratio);
-
-							tabManager.updateTabAnchorLine(tabManager.activeTabId, estimatedLine);
-						}
-					}
-					break;
-				}
-			}
+		if (nextMode === 'split') {
+			tabManager.setSplitEnabled(tab.id, true);
+			if (liveMode) toggleLiveMode();
 		}
-
-		syncEditorToPreviewScroll(target);
-	}
-
-	function saveRecentFile(path: string) {
-		let files = [...recentFiles].filter((f) => f !== path);
-		files.unshift(path);
-		recentFiles = files.slice(0, 9);
-		localStorage.setItem('recent-files', JSON.stringify(recentFiles));
 	}
 
 	function loadRecentFiles() {
@@ -649,14 +992,101 @@
 	}
 
 	function deleteRecentFile(path: string) {
-		recentFiles = recentFiles.filter((f) => f !== path);
+		const normalizedPath = normalizeComparablePath(path);
+		recentFiles = recentFiles.filter((f) => normalizeComparablePath(f) !== normalizedPath);
 		localStorage.setItem('recent-files', JSON.stringify(recentFiles));
 	}
 
 	function removeRecentFile(path: string, event: MouseEvent) {
 		event.stopPropagation();
 		deleteRecentFile(path);
-		if (currentFile === path) tabManager.closeTab(tabManager.activeTabId!);
+		if (normalizeComparablePath(currentFile) === normalizeComparablePath(path)) tabManager.closeTab(tabManager.activeTabId!);
+	}
+
+	function normalizeComparablePath(path: string) {
+		const normalized = path.replace(/\\/g, '/');
+		return normalized.match(/^[a-zA-Z]:\//) ? normalized.toLowerCase() : normalized;
+	}
+
+	function extractLinkFragment(rawPath: string | null) {
+		if (!rawPath) return null;
+		const hashIndex = rawPath.indexOf('#');
+		if (hashIndex === -1 || hashIndex === rawPath.length - 1) return null;
+
+		try {
+			return decodeURIComponent(rawPath.slice(hashIndex + 1));
+		} catch {
+			return rawPath.slice(hashIndex + 1);
+		}
+	}
+
+	function normalizeFragmentIdentifier(value: string) {
+		return value
+			.trim()
+			.toLowerCase()
+			.replace(/[%\s]+/g, '-')
+			.replace(/-+/g, '-');
+	}
+
+	function findFragmentTarget(fragment: string) {
+		if (!markdownBody) return null;
+
+		const exact = document.getElementById(fragment);
+		if (exact && markdownBody.contains(exact)) {
+			return exact.classList.contains('anchor') ? (exact.parentElement as HTMLElement | null) ?? exact : exact;
+		}
+
+		const normalizedFragment = normalizeFragmentIdentifier(fragment);
+		const candidates = Array.from(markdownBody.querySelectorAll('[id]')) as HTMLElement[];
+		for (const candidate of candidates) {
+			const candidateId = candidate.getAttribute('id');
+			if (!candidateId) continue;
+			if (normalizeFragmentIdentifier(candidateId) === normalizedFragment) {
+				return candidate.classList.contains('anchor') ? (candidate.parentElement as HTMLElement | null) ?? candidate : candidate;
+			}
+		}
+
+		return null;
+	}
+
+	function scrollToFragment(fragment: string) {
+		if (!markdownBody) return;
+
+		const target = findFragmentTarget(fragment);
+		if (!target) return;
+
+		const targetScroll = Math.max(0, target.offsetTop - 60);
+		if (Math.abs(markdownBody.scrollTop - targetScroll) > 5) {
+			isProgrammaticScroll = true;
+			markdownBody.scrollTop = targetScroll;
+		}
+
+		syncPreviewState(markdownBody, true);
+	}
+
+	function scrollPreviewToTop() {
+		if (!markdownBody) return;
+
+		if (markdownBody.scrollTop !== 0) {
+			isProgrammaticScroll = true;
+			markdownBody.scrollTop = 0;
+		}
+
+		syncPreviewState(markdownBody, true);
+	}
+
+	function navigateToHistoryLocation(location: { path: string; fragment: string | null }) {
+		const activePath = tabManager.activeTab?.path ?? '';
+		if (normalizeComparablePath(activePath) === normalizeComparablePath(location.path)) {
+			if (location.fragment) {
+				scrollToFragment(location.fragment);
+			} else {
+				scrollPreviewToTop();
+			}
+			return;
+		}
+
+		loadMarkdown(location.path, { skipTabManagement: true, fragment: location.fragment });
 	}
 
 	function resolvePath(basePath: string, relativePath: string) {
@@ -669,6 +1099,111 @@
 			else parts.push(p);
 		}
 		return parts.join('/');
+	}
+
+	function isImageFile(filename: string): boolean {
+		const ext = filename.split('.').pop()?.toLowerCase();
+		return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext || '');
+	}
+
+	function sanitizeFilename(filename: string): string {
+		const basename = filename.split(/[/\\]/).pop() || 'file';
+
+		const lastDotIndex = basename.lastIndexOf('.');
+		const name = lastDotIndex > 0 ? basename.slice(0, lastDotIndex) : basename;
+		const ext = lastDotIndex > 0 ? basename.slice(lastDotIndex) : '';
+
+		const cleanedName = name
+			.replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+			.replace(/[. ]+$/g, '')
+			.trim()
+			.substring(0, 200);
+		const cleanedExt = ext.replace(/[<>:"/\\|?*\x00-\x1F]/g, '');
+
+		if (cleanedName.length < 1) {
+			const now = new Date();
+			const dateStr = now.toISOString().slice(0, 19).replace(/[-:T]/g, '').replace(/(\d{8})(\d{6})/, '$1_$2');
+			const randomStr = Math.random().toString(36).substring(2, 10);
+			return `${dateStr}_${randomStr}${cleanedExt}`;
+		}
+
+		return cleanedName + cleanedExt;
+	}
+
+	async function handleEditorFileDrop(paths: string[]) {
+		const currentTab = tabManager.activeTab;
+		if (!currentTab?.path) {
+			await askCustom(
+				'Please save the document first before dropping files.',
+				{ title: 'Save Required', kind: 'warning' }
+			);
+			return;
+		}
+
+		let insertedCount = 0;
+
+		for (const sourcePath of paths) {
+			try {
+				const originalFilename = sourcePath.split(/[/\\]/).pop() || 'file';
+				const isImage = isImageFile(originalFilename);
+				const targetFilename = sanitizeFilename(originalFilename);
+
+				const relativePath = await invoke<string>('copy_file_to_attachment', {
+					sourcePath,
+					documentPath: currentTab.path,
+					targetFilename,
+					isImage
+				});
+				const markdownPath = encodeMarkdownPath(relativePath);
+
+				// Use original filename for alt text (remove extension)
+				const nameWithoutExt = originalFilename.replace(/\.[^/.]+$/, '');
+
+				const text = isImage
+					? `![${nameWithoutExt}](${markdownPath})`
+					: `[${originalFilename}](${markdownPath})`;
+
+				// Insert text into Editor component
+				editorComponent?.insertText(text);
+				insertedCount++;
+
+			} catch (error) {
+				console.error('Failed to copy file:', error);
+				await askCustom(
+					`Failed to add file: ${error}`,
+					{ title: 'Error', kind: 'error' }
+				);
+			}
+		}
+
+		// Focus window and editor after all files are processed
+		if (insertedCount > 0) {
+			await tick(); // Wait for DOM updates
+
+			// Focus Tauri window at OS level - try multiple times with delay
+			try {
+				const appWindow = getCurrentWindow();
+
+				// First attempt - immediate
+				await appWindow.setFocus();
+
+				// Second attempt - with delay to overcome drag event focus steal
+				setTimeout(async () => {
+					try {
+						await appWindow.setFocus();
+						editorComponent?.focus();
+					} catch (e) {
+						console.error('Failed delayed window focus:', e);
+					}
+				}, 100);
+
+			} catch (error) {
+				console.error('Failed to focus window:', error);
+			}
+
+			// Focus Monaco editor immediately
+			editorComponent?.focus();
+		}
 	}
 
 	function isYoutubeLink(url: string) {
@@ -714,64 +1249,12 @@
 	}
 
 	async function toggleEdit(autoSave = false) {
-		const tab = tabManager.activeTab;
-		if (!tab || tab.path === undefined) return;
-
-		if (isEditing) {
-			// Switch back to view
-			if (tab.isDirty && tab.path !== '') {
-				if (autoSave) {
-					const success = await saveContent();
-					if (!success) return; // If save fails, stay in edit mode?
-				} else {
-					const response = await askCustom('You have unsaved changes. Do you want to save them before returning to view mode?', {
-						title: 'Unsaved Changes',
-						kind: 'warning',
-						showSave: true,
-					});
-
-					if (response === 'cancel') return;
-					if (response === 'save') {
-						const success = await saveContent();
-						if (!success) return;
-					} else if (response === 'discard') {
-						tab.rawContent = tab.originalContent;
-					}
-				}
-			}
-			tab.isEditing = false;
-			if (tab.path !== '') {
-				tab.isDirty = false;
-				await loadMarkdown(tab.path);
-			} else {
-				try {
-					const html = (await invoke('render_markdown', { content: tab.rawContent })) as string;
-					const processedInfo = processMarkdownHtml(html, '');
-					tabManager.updateTabContent(tab.id, processedInfo);
-				} catch (e) {
-					console.error('Failed to render markdown for unsaved file', e);
-				}
-			}
-		} else {
-			// Switch to edit
-			if (tab.path !== '') {
-				try {
-					const content = (await invoke('read_file_content', { path: tab.path })) as string;
-					tab.rawContent = content;
-					tab.isEditing = true;
-					tab.isDirty = false;
-				} catch (e) {
-					console.error('Failed to read file for editing', e);
-				}
-			} else {
-				tab.isEditing = true;
-			}
-		}
+		await setViewMode(isEditing ? 'viewer' : 'edit', autoSave);
 	}
 
 	async function saveContent(): Promise<boolean> {
 		const tab = tabManager.activeTab;
-		if (!tab || (!tab.isEditing && !tab.isSplit)) return false;
+		if (!tab || (!isEditing && !isSplit)) return false;
 
 		let targetPath = tab.path;
 
@@ -799,6 +1282,17 @@
 			}
 			tab.isDirty = false;
 			tab.originalContent = tab.rawContent;
+
+			// Clean up unused attachment files
+			try {
+				await invoke('cleanup_unused_attachments', {
+					documentPath: targetPath,
+					content: tab.rawContent
+				});
+			} catch (cleanupError) {
+				// Don't fail the save operation if cleanup fails
+				console.warn('Failed to cleanup attachments:', cleanupError);
+			}
 			return true;
 		} catch (e) {
 			console.error('Failed to save file', e);
@@ -820,11 +1314,45 @@
 
 		if (selected) {
 			try {
-				await invoke('save_file_content', { path: selected, content: tab.rawContent });
+				let contentToSave = tab.rawContent;
+
+				if (!isEditing && !isSplit && tab.path) {
+					contentToSave = await invoke<string>('read_file_content', { path: tab.path });
+				}
+
+				if (tab.path && tab.path !== selected) {
+					await invoke('copy_attachments_for_save_as', {
+						sourceDocumentPath: tab.path,
+						targetDocumentPath: selected
+					});
+
+					contentToSave = await invoke<string>('prepare_save_as_content', {
+						sourceDocumentPath: tab.path,
+						targetDocumentPath: selected,
+						content: contentToSave
+					});
+				}
+
+				await invoke('save_file_content', { path: selected, content: contentToSave });
+				const html = (await invoke('render_markdown', { content: contentToSave })) as string;
+				const processedInfo = processMarkdownHtml(html, selected);
+
 				tabManager.updateTabPath(tab.id, selected);
+				tabManager.updateTabContent(tab.id, processedInfo);
 				saveRecentFile(selected);
 				tab.isDirty = false;
-				tab.originalContent = tab.rawContent;
+				tab.rawContent = contentToSave;
+				tab.originalContent = contentToSave;
+
+				try {
+					await invoke('cleanup_unused_attachments', {
+						documentPath: selected,
+						content: contentToSave
+					});
+				} catch (cleanupError) {
+					console.warn('Failed to cleanup attachments after save as:', cleanupError);
+				}
+
 				return true;
 			} catch (e) {
 				console.error('Failed to save file as', e);
@@ -877,19 +1405,131 @@
 		}
 	}
 
+	function findContextMenuImage(target: EventTarget | null): HTMLImageElement | null {
+		let current = target instanceof HTMLElement ? target : null;
+		while (current && current !== document.body) {
+			if (current instanceof HTMLImageElement) {
+				return current;
+			}
+			current = current.parentElement;
+		}
+		return null;
+	}
+
+	function findContextMenuMedia(target: EventTarget | null): HTMLMediaElement | null {
+		let current = target instanceof HTMLElement ? target : null;
+		while (current && current !== document.body) {
+			if (current instanceof HTMLVideoElement || current instanceof HTMLAudioElement) {
+				return current;
+			}
+			current = current.parentElement;
+		}
+		return null;
+	}
+
+	function findContextMenuAnchor(target: EventTarget | null): HTMLAnchorElement | null {
+		let current = target instanceof HTMLElement ? target : null;
+		while (current && current.tagName !== 'A' && current !== document.body) {
+			current = current.parentElement as HTMLElement;
+		}
+		return current?.tagName === 'A' ? (current as HTMLAnchorElement) : null;
+	}
+
+	function resolveLocalTargetPath(rawPath: string | null, basePath = currentFile): string | null {
+		if (!rawPath || !basePath) return null;
+		if (rawPath.startsWith('#') || rawPath.startsWith('data:') || rawPath.match(/^[a-z]+:\/\//i)) return null;
+
+		const pathWithoutHash = rawPath.split('#')[0].split('?')[0];
+		if (!pathWithoutHash) return null;
+
+		return resolvePath(basePath, decodeMarkdownPath(pathWithoutHash));
+	}
+
+	function findContextMenuPath(target: EventTarget | null): string | null {
+		const targetImage = findContextMenuImage(target);
+		if (targetImage?.dataset.localPath) return targetImage.dataset.localPath;
+
+		const targetMedia = findContextMenuMedia(target);
+		if (targetMedia?.dataset.localPath) return targetMedia.dataset.localPath;
+
+		const targetAnchor = findContextMenuAnchor(target);
+		if (targetAnchor) {
+			if (targetAnchor.dataset.localPath) return targetAnchor.dataset.localPath;
+			return resolveLocalTargetPath(targetAnchor.getAttribute('href'));
+		}
+
+		return null;
+	}
+
+	function decodeImageDataUrl(dataUrl: string): number[] {
+		const [, base64 = ''] = dataUrl.split(',', 2);
+		return Array.from(Uint8Array.from(atob(base64), (char) => char.charCodeAt(0)));
+	}
+
+	async function copyPathToClipboard(path: string) {
+		try {
+			await navigator.clipboard.writeText(path);
+		} catch (error) {
+			console.error('Failed to copy path:', error);
+			await askCustom(`Failed to copy path: ${error}`, { title: 'Error', kind: 'error' });
+		}
+	}
+
+	async function copyImageToClipboard(image: HTMLImageElement) {
+		try {
+			let bytes: number[];
+			const localPath = image.dataset.localPath;
+
+			if (localPath) {
+				bytes = await invoke<number[]>('read_binary_file', { path: localPath });
+			} else {
+				const imageSource = image.currentSrc || image.src;
+				if (imageSource.startsWith('data:')) {
+					bytes = decodeImageDataUrl(imageSource);
+				} else {
+					const response = await fetch(imageSource);
+					if (!response.ok) {
+						throw new Error(`Failed to fetch image: ${response.status}`);
+					}
+					bytes = Array.from(new Uint8Array(await response.arrayBuffer()));
+				}
+			}
+
+			await writeImageBinary(bytes);
+		} catch (error) {
+			console.error('Failed to copy image:', error);
+			await askCustom(`Failed to copy image: ${error}`, { title: 'Error', kind: 'error' });
+		}
+	}
+
 	function handleContextMenu(e: MouseEvent) {
 		if (mode !== 'app') return;
 		e.preventDefault();
 
 		const selection = window.getSelection();
 		const hasSelection = selection ? selection.toString().length > 0 : false;
+		const targetImage = findContextMenuImage(e.target);
+		const targetPath = findContextMenuPath(e.target);
+		const copyItems: ContextMenuItem[] = [];
+
+		if (targetImage) {
+			copyItems.push({ label: 'Copy Image', onClick: () => void copyImageToClipboard(targetImage) });
+		}
+
+		if (targetPath) {
+			copyItems.push({ label: 'Copy Path', detail: targetPath, onClick: () => void copyPathToClipboard(targetPath) });
+		}
+
+		if (!copyItems.length && hasSelection) {
+			copyItems.push({ label: 'Copy', onClick: () => document.execCommand('copy') });
+		}
 
 		docContextMenu = {
 			show: true,
 			x: e.clientX,
 			y: e.clientY,
 			items: [
-				...(hasSelection ? [{ label: 'Copy', onClick: () => document.execCommand('copy') }] : []),
+				...copyItems,
 				{ label: 'Select All', onClick: () => document.execCommand('selectAll') },
 				{ separator: true },
 				{ label: 'Open File Location', onClick: openFileLocation, disabled: !currentFile },
@@ -906,9 +1546,10 @@
 		while (target && target.tagName !== 'A' && target !== document.body) target = target.parentElement as HTMLElement;
 		if (target?.tagName === 'A') {
 			const anchor = target as HTMLAnchorElement;
-			if (anchor.href) {
+			const tooltipText = anchor.dataset.localPath || anchor.getAttribute('href') || anchor.href;
+			if (tooltipText) {
 				const rect = anchor.getBoundingClientRect();
-				tooltip = { show: true, text: anchor.href, x: rect.left + rect.width / 2, y: rect.top - 8 };
+				tooltip = { show: true, text: tooltipText, x: rect.left + rect.width / 2, y: rect.top - 8 };
 			}
 		}
 	}
@@ -925,20 +1566,27 @@
 		while (target && target.tagName !== 'A' && target !== document.body) target = target.parentElement as HTMLElement;
 		if (target?.tagName === 'A') {
 			const anchor = target as HTMLAnchorElement;
+			const localPath = anchor.dataset.localPath;
+			const localFragment = anchor.dataset.localFragment;
 			const rawHref = anchor.getAttribute('href');
-			if (!rawHref) return;
+			if (!rawHref && !localPath) return;
 
-			if (rawHref.startsWith('#')) return;
-			const isMarkdown = ['.md', '.markdown', '.mdown', '.mkd'].some((ext) => {
-				const urlNoHash = rawHref.split('#')[0].split('?')[0];
-				return urlNoHash.toLowerCase().endsWith(ext);
-			});
-
-			if (isMarkdown && !rawHref.match(/^[a-z]+:\/\//i)) {
+			if (rawHref?.startsWith('#')) {
 				event.preventDefault();
-				const urlNoHash = rawHref.split('#')[0].split('?')[0];
-				const resolved = resolvePath(currentFile, urlNoHash);
-				await loadMarkdown(resolved, { navigate: true });
+				const fragment = extractLinkFragment(rawHref);
+				if (fragment) {
+					if (tabManager.activeTabId && currentFile) {
+						tabManager.navigate(tabManager.activeTabId, currentFile, fragment);
+					}
+					scrollToFragment(fragment);
+				}
+				return;
+			}
+			const localMarkdownPath = localPath && ['.md', '.markdown', '.mdown', '.mkd'].some((ext) => localPath.toLowerCase().endsWith(ext));
+
+			if (localMarkdownPath) {
+				event.preventDefault();
+				await loadMarkdown(localPath, { fragment: localFragment, linkedFromTabId: tabManager.activeTabId });
 				return;
 			}
 
@@ -969,7 +1617,7 @@
 
 	$effect(() => {
 		const tab = tabManager.activeTab;
-		if (tab && tab.isSplit && tab.rawContent !== undefined) {
+		if (tab && isSplit && tab.rawContent !== undefined) {
 			clearTimeout(debounceTimer);
 			debounceTimer = setTimeout(() => {
 				invoke('render_markdown', { content: tab.rawContent })
@@ -984,49 +1632,8 @@
 	});
 
 	async function toggleSplitView(tabId: string, autoSave = false) {
-		const tab = tabManager.tabs.find((t) => t.id === tabId);
-		if (!tab) return;
-
-		if (!tab.isSplit) {
-			if (!tab.isEditing && !tab.rawContent && tab.path) {
-				try {
-					const content = (await invoke('read_file_content', { path: tab.path })) as string;
-					tab.rawContent = content;
-					tab.originalContent = content;
-				} catch (e) {
-					console.error('Failed to load raw content for split view', e);
-				}
-			}
-			tabManager.setSplitEnabled(tab.id, true);
-			if (liveMode) toggleLiveMode();
-		} else {
-			if (tab.isDirty && tab.path !== '') {
-				if (autoSave) {
-					const success = await saveContent();
-					if (!success) return;
-				} else {
-					const response = await askCustom('You have unsaved changes. Do you want to save them before closing split view?', {
-						title: 'Unsaved Changes',
-						kind: 'warning',
-						showSave: true,
-					});
-
-					if (response === 'cancel') return;
-					if (response === 'save') {
-						const success = await saveContent();
-						if (!success) return;
-					} else if (response === 'discard') {
-						tab.rawContent = tab.originalContent;
-					}
-				}
-			}
-			tabManager.setSplitEnabled(tab.id, false);
-			if (tab.path !== '') {
-				tab.isDirty = false;
-				await loadMarkdown(tab.path);
-			} else {
-			}
-		}
+		void tabId;
+		await setViewMode(isSplit ? 'viewer' : 'split', autoSave);
 	}
 
 	function handleKeyDown(e: KeyboardEvent) {
@@ -1036,11 +1643,17 @@
 		const key = e.key.toLowerCase();
 		const code = e.code;
 
-		const isSplit = tabManager.activeTab?.isSplit;
-
 		if (cmdOrCtrl && key === 'w') {
 			e.preventDefault();
 			closeFile();
+		}
+		if (e.altKey && !cmdOrCtrl && key === 'arrowleft') {
+			e.preventDefault();
+			handleHistoryBack();
+		}
+		if (e.altKey && !cmdOrCtrl && key === 'arrowright') {
+			e.preventDefault();
+			handleHistoryForward();
 		}
 		if (cmdOrCtrl && !e.shiftKey && key === 't') {
 			e.preventDefault();
@@ -1093,16 +1706,40 @@
 		if (e.button === 3) {
 			// Back
 			e.preventDefault();
-			if (tabManager.activeTabId) {
-				const path = tabManager.goBack(tabManager.activeTabId);
-				if (path) loadMarkdown(path, { skipTabManagement: true });
-			}
+			handleHistoryBack();
 		} else if (e.button === 4) {
 			// Forward
 			e.preventDefault();
-			if (tabManager.activeTabId) {
-				const path = tabManager.goForward(tabManager.activeTabId);
-				if (path) loadMarkdown(path, { skipTabManagement: true });
+			handleHistoryForward();
+		}
+	}
+
+	function handleHistoryBack() {
+		if (tabManager.activeTabId) {
+			const location = tabManager.goBack(tabManager.activeTabId);
+			if (location) {
+				navigateToHistoryLocation(location);
+				return;
+			}
+
+			const targetTabId = tabManager.goBackLinked(tabManager.activeTabId);
+			if (targetTabId) {
+				tabManager.setActive(targetTabId);
+			}
+		}
+	}
+
+	function handleHistoryForward() {
+		if (tabManager.activeTabId) {
+			const location = tabManager.goForward(tabManager.activeTabId);
+			if (location) {
+				navigateToHistoryLocation(location);
+				return;
+			}
+
+			const targetTabId = tabManager.goForwardLinked(tabManager.activeTabId);
+			if (targetTabId) {
+				tabManager.setActive(targetTabId);
 			}
 		}
 	}
@@ -1196,7 +1833,6 @@
 		invoke('show_window').catch(console.error);
 
 		const init = async () => {
-			const { getCurrentWindow } = await import('@tauri-apps/api/window');
 			const appWindow = getCurrentWindow();
 			const appMode = (await invoke('get_app_mode')) as any;
 
@@ -1334,16 +1970,22 @@
 
 			unlisteners.push(
 				await appWindow.onDragDropEvent((event) => {
-					if (isEditing) {
-						isDragging = false;
-						return;
-					}
-
 					if (event.payload.type === 'enter' || event.payload.type === 'over') {
 						isDragging = true;
 					} else if (event.payload.type === 'drop') {
 						isDragging = false;
-						event.payload.paths.forEach((path) => loadMarkdown(path));
+
+						const currentTab = tabManager.activeTab;
+						// Editor is visible in both full edit mode (isEditing) and split view mode (isSplit)
+						const shouldAttachFile = currentTab && (isEditing || isSplit);
+
+						if (shouldAttachFile) {
+							// Editor mode or Split view: attach files
+							handleEditorFileDrop(event.payload.paths);
+						} else {
+							// Viewer mode: open files (default behavior)
+							event.payload.paths.forEach((path) => loadMarkdown(path));
+						}
 					} else {
 						isDragging = false;
 					}
@@ -1392,6 +2034,8 @@
 		onopenFile={selectFile}
 		onsaveFile={saveContent}
 		onsaveFileAs={saveContentAs}
+		onback={handleHistoryBack}
+		onforward={handleHistoryForward}
 		onexit={() => {
 			appWindow.close();
 		}}
@@ -1401,6 +2045,7 @@
 		ontoggleEdit={() => toggleEdit()}
 		ontoggleSplit={() => tabManager.activeTabId && toggleSplitView(tabManager.activeTabId)}
 		{isEditing}
+		{isSplit}
 		ondetach={handleDetach}
 		ontabclick={() => (showHome = false)}
 		onresetZoom={() => (zoomLevel = 100)}
@@ -1437,6 +2082,8 @@
 		onopenFile={selectFile}
 		onsaveFile={saveContent}
 		onsaveFileAs={saveContentAs}
+		onback={handleHistoryBack}
+		onforward={handleHistoryForward}
 		onexit={() => {
 			appWindow.close();
 		}}
@@ -1446,6 +2093,7 @@
 		ontoggleEdit={() => toggleEdit()}
 		ontoggleSplit={() => tabManager.activeTabId && toggleSplitView(tabManager.activeTabId)}
 		{isEditing}
+		{isSplit}
 		ondetach={handleDetach}
 		ontabclick={() => (showHome = false)}
 		onresetZoom={() => (zoomLevel = 100)}
@@ -1476,7 +2124,7 @@
 					<div class="pane editor-pane" class:active={isEditing || isSplit} style="flex: {isSplit ? tabManager.activeTab.splitRatio : isEditing ? 1 : 0}">
 						{#if isEditing || isSplit}
 							<Editor
-								bind:this={editorPane}
+								bind:this={editorComponent}
 								bind:value={tabManager.activeTab.rawContent}
 								language={editorLanguage}
 								{theme}
@@ -1538,7 +2186,7 @@
 		onsave={handleModalSave}
 		oncancel={handleModalCancel} />
 
-	{#if isDragging && !isEditing}
+	{#if isDragging && !isEditing && !isSplit}
 		<div class="drag-overlay" role="presentation">
 			<div class="drag-message">
 				<svg

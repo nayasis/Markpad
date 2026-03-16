@@ -22,6 +22,8 @@
 		onopenFile,
 		onsaveFile,
 		onsaveFileAs,
+		onback,
+		onforward,
 		onexit,
 		ontoggleHome,
 		ononpenFileLocation,
@@ -30,6 +32,7 @@
 		ontoggleEdit,
 		ontoggleSplit,
 		isEditing,
+		isSplit,
 		ondetach,
 		ontabclick,
 		zoomLevel,
@@ -55,6 +58,8 @@
 		onopenFile?: () => void;
 		onsaveFile?: () => void;
 		onsaveFileAs?: () => void;
+		onback?: () => void;
+		onforward?: () => void;
 		onexit?: () => void;
 		ontoggleHome: () => void;
 		ononpenFileLocation: () => void;
@@ -63,6 +68,7 @@
 		ontoggleEdit: () => void;
 		ontoggleSplit?: () => void;
 		isEditing: boolean;
+		isSplit?: boolean;
 		ondetach: (tabId: string) => void;
 		ontabclick?: () => void;
 		zoomLevel?: number;
@@ -171,26 +177,27 @@
 		}
 	});
 
-	const inlineIds = ['fullWidth', 'edit', 'split', 'sync', 'live'];
+	const inlineIds = ['back', 'forward', 'fullWidth', 'edit', 'split', 'sync', 'live'];
 
 	let visibleActionIds = $derived.by(() => {
 		const list: string[] = [];
 
 		if (tabManager.activeTab && !showHome) {
+			list.push('back', 'forward');
 			if (currentFile) list.push('open_loc');
 
 			const ext = currentFile ? currentFile.split('.').pop()?.toLowerCase() || '' : 'md';
 			const isMarkdown = ['md', 'markdown', 'mdown', 'mkd'].includes(ext);
 
 			if (isMarkdown) {
-				if (!tabManager.activeTab?.isSplit) {
+				if (!isSplit) {
 					list.push('fullWidth');
 					if (!isEditing && currentFile) {
 						list.push('live');
 					}
 					list.push('edit');
 				}
-				if (tabManager.activeTab?.isSplit) {
+				if (isSplit) {
 					list.push('sync');
 				}
 				list.push('split');
@@ -237,6 +244,9 @@
 			window.removeEventListener('click', handleGlobalClick);
 		};
 	});
+
+	let canGoBack = $derived(tabManager.activeTab ? tabManager.canGoBack(tabManager.activeTab.id) || tabManager.canGoBackLinked(tabManager.activeTab.id) : false);
+	let canGoForward = $derived(tabManager.activeTab ? tabManager.canGoForward(tabManager.activeTab.id) || tabManager.canGoForwardLinked(tabManager.activeTab.id) : false);
 </script>
 
 <svelte:window bind:innerWidth />
@@ -327,7 +337,7 @@
 						Open File...
 						<span class="menu-shortcut">{modifier}+O</span>
 					</button>
-					{#if currentFile !== '' || (tabManager.activeTab && tabManager.activeTab.isEditing)}
+					{#if currentFile !== '' || isEditing || isSplit}
 						<button
 							class="home-menu-item"
 							onclick={() => {
@@ -514,9 +524,41 @@
 							></svg>
 						<span class="action-label">Open Location</span>
 					</button>
+				{:else if id === 'back'}
+					<button
+						class="title-action-btn"
+						onclick={() => onback?.()}
+						disabled={!canGoBack}
+						aria-label="Go Back"
+						onmouseenter={(e) => showTooltip(e, 'Go back')}
+						onmouseleave={hideTooltip}
+						transition:fly={{ x: 10, duration: 200 }}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+							<path d="M19 12H5"></path>
+							<path d="M12 19l-7-7 7-7"></path>
+						</svg>
+						<span class="action-label">Back</span>
+						<span class="menu-shortcut">Alt+Left</span>
+					</button>
+				{:else if id === 'forward'}
+					<button
+						class="title-action-btn"
+						onclick={() => onforward?.()}
+						disabled={!canGoForward}
+						aria-label="Go Forward"
+						onmouseenter={(e) => showTooltip(e, 'Go forward')}
+						onmouseleave={hideTooltip}
+						transition:fly={{ x: 10, duration: 200 }}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+							<path d="M5 12h14"></path>
+							<path d="M12 5l7 7-7 7"></path>
+						</svg>
+						<span class="action-label">Forward</span>
+						<span class="menu-shortcut">Alt+Right</span>
+					</button>
 				{:else if id === 'split'}
 					<button
-						class="title-action-btn {tabManager.activeTab?.isSplit ? 'active' : ''}"
+						class="title-action-btn {isSplit ? 'active' : ''}"
 						onclick={() => ontoggleSplit?.()}
 						aria-label="Toggle Split View"
 						onmouseenter={(e) => showTooltip(e, 'Split view', 'H')}
@@ -866,6 +908,11 @@
 		border-radius: 4px;
 		cursor: pointer;
 		transition: all 0.1s;
+	}
+
+	.title-action-btn:disabled {
+		opacity: 0.35;
+		cursor: default;
 	}
 
 	.title-actions.show-dropdown .menu-zoom-item {

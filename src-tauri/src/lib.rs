@@ -1,11 +1,19 @@
 use comrak::{markdown_to_html, ComrakExtensionOptions, ComrakOptions};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::{Captures, Regex};
+use serde::Serialize;
 use std::borrow::Cow;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+#[derive(Serialize)]
+struct CleanupResult {
+    deleted_count: usize,
+    used_files: Vec<String>,
+    checked_files: Vec<String>,
+}
 
 struct WatcherState {
     watcher: Mutex<Option<RecommendedWatcher>>,
@@ -18,35 +26,129 @@ async fn show_window(window: tauri::Window) {
     window.show().unwrap();
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImageSizeSpec<'a> {
+    width: Option<&'a str>,
+    height: Option<&'a str>,
+}
+
+fn escape_html_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn parse_image_size_spec(value: &str) -> Option<ImageSizeSpec<'_>> {
+    fn parse_dimension(dimension: &str) -> Option<Option<&str>> {
+        let dimension = dimension.trim();
+        if dimension.is_empty() {
+            Some(None)
+        } else if dimension.chars().all(|ch| ch.is_ascii_digit()) {
+            Some(Some(dimension))
+        } else {
+            None
+        }
+    }
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((width, height)) = trimmed.split_once('x') {
+        let width = parse_dimension(width)?;
+        let height = parse_dimension(height)?;
+
+        if width.is_none() && height.is_none() {
+            None
+        } else {
+            Some(ImageSizeSpec { width, height })
+        }
+    } else {
+        let width = parse_dimension(trimmed)?;
+        width.map(|width| ImageSizeSpec {
+            width: Some(width),
+            height: None,
+        })
+    }
+}
+
+fn build_image_tag(path: &str, alt: &str, size: Option<ImageSizeSpec<'_>>) -> String {
+    let mut attributes = vec![format!(r#"src="{}""#, escape_html_attr(&path.replace(' ', "%20")))];
+
+    if let Some(size) = size {
+        if let Some(width) = size.width {
+            attributes.push(format!(r#"width="{}""#, width));
+        }
+
+        if let Some(height) = size.height {
+            attributes.push(format!(r#"height="{}""#, height));
+        }
+    }
+
+    attributes.push(format!(r#"alt="{}""#, escape_html_attr(alt)));
+
+    format!("<img {} />", attributes.join(" "))
+}
+
 fn process_obsidian_embeds(content: &str) -> Cow<'_, str> {
     let re = Regex::new(r"!\[\[(.*?)\]\]").unwrap();
 
     re.replace_all(content, |caps: &Captures| {
         let inner = &caps[1];
-        let mut parts = inner.split('|');
-        let path = parts.next().unwrap_or("");
-        let size = parts.next();
+        let mut parts = inner.splitn(2, '|');
+        let path = parts.next().unwrap_or("").trim();
+        let size = parts.next().and_then(parse_image_size_spec);
 
-        let path_escaped = path.replace(" ", "%20");
+        build_image_tag(path, path, size)
+    })
+}
 
-        if let Some(size_str) = size {
-            if size_str.contains('x') {
-                let mut dims = size_str.split('x');
-                let width = dims.next().unwrap_or("");
-                let height = dims.next().unwrap_or("");
-                format!(
-                    "<img src=\"{}\" width=\"{}\" height=\"{}\" alt=\"{}\" />",
-                    path_escaped, width, height, path
-                )
-            } else {
-                format!(
-                    "<img src=\"{}\" width=\"{}\" alt=\"{}\" />",
-                    path_escaped, size_str, path
-                )
-            }
-        } else {
-            format!("<img src=\"{}\" alt=\"{}\" />", path_escaped, path)
+fn process_markdown_image_sizes(html: &str) -> Cow<'_, str> {
+    let image_re = Regex::new(r#"<img(?P<attrs>[^>]*?)(?:\s*/)?>"#).unwrap();
+    let alt_re = Regex::new(r#"\salt="(?P<alt>[^"]*)""#).unwrap();
+
+    image_re.replace_all(html, |caps: &Captures| {
+        let full = caps.get(0).unwrap().as_str();
+        let attrs = caps.name("attrs").unwrap().as_str();
+        let attrs = attrs.trim_end();
+
+        if attrs.contains(r#" width=""#) || attrs.contains(r#" height=""#) {
+            return full.to_string();
         }
+
+        let Some(alt_caps) = alt_re.captures(attrs) else {
+            return full.to_string();
+        };
+
+        let alt = alt_caps.name("alt").unwrap().as_str();
+        let Some(pipe_index) = alt.rfind('|') else {
+            return full.to_string();
+        };
+
+        let actual_alt = &alt[..pipe_index];
+        let size = &alt[pipe_index + 1..];
+        let Some(size) = parse_image_size_spec(size) else {
+            return full.to_string();
+        };
+
+        let mut new_attrs = attrs.replacen(
+            alt_caps.get(0).unwrap().as_str(),
+            &format!(r#" alt="{}""#, actual_alt),
+            1,
+        );
+
+        if let Some(width) = size.width {
+            new_attrs.push_str(&format!(r#" width="{}""#, width));
+        }
+
+        if let Some(height) = size.height {
+            new_attrs.push_str(&format!(r#" height="{}""#, height));
+        }
+
+        format!("<img{} />", new_attrs)
     })
 }
 
@@ -70,8 +172,10 @@ fn convert_markdown(content: &str) -> String {
     options.render.unsafe_ = true;
     options.render.hardbreaks = true;
     options.render.sourcepos = true;
+    options.extension.header_ids = Some(String::new());
 
-    markdown_to_html(&processed, &options)
+    let html = markdown_to_html(&processed, &options);
+    process_markdown_image_sizes(&html).into_owned()
 }
 
 #[tauri::command]
@@ -85,14 +189,190 @@ fn render_markdown(content: String) -> String {
     convert_markdown(&content)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::convert_markdown;
+
+    #[test]
+    fn renders_obsidian_embed_with_width() {
+        let html = convert_markdown("![[image.png|300]]");
+
+        assert!(html.contains(r#"<img src="image.png" width="300" alt="image.png" />"#));
+    }
+
+    #[test]
+    fn renders_markdown_image_with_width_from_alt() {
+        let html = convert_markdown("![preview|300](image.png)");
+
+        assert!(html.contains(r#"src="image.png""#));
+        assert!(html.contains(r#"alt="preview""#));
+        assert!(html.contains(r#"width="300""#));
+        assert!(!html.contains(r#"alt="preview|300""#));
+    }
+
+    #[test]
+    fn renders_markdown_image_with_width_and_height_from_alt() {
+        let html = convert_markdown("![preview|300x200](image.png)");
+
+        assert!(html.contains(r#"src="image.png""#));
+        assert!(html.contains(r#"alt="preview""#));
+        assert!(html.contains(r#"width="300""#));
+        assert!(html.contains(r#"height="200""#));
+        assert!(!html.contains(r#"alt="preview|300x200""#));
+    }
+
+    #[test]
+    fn keeps_non_numeric_markdown_alt_suffixes_untouched() {
+        let html = convert_markdown("![preview|full](image.png)");
+
+        assert!(html.contains(r#"src="image.png""#));
+        assert!(html.contains(r#"alt="preview|full""#));
+        assert!(!html.contains(r#"width=""#));
+        assert!(!html.contains(r#"height=""#));
+    }
+
+    #[test]
+    fn uses_last_pipe_when_parsing_markdown_alt_sizes() {
+        let html = convert_markdown("![foo|bar|320](image.png)");
+
+        assert!(html.contains(r#"src="image.png""#));
+        assert!(html.contains(r#"alt="foo|bar""#));
+        assert!(html.contains(r#"width="320""#));
+        assert!(!html.contains(r#"alt="foo|bar|320""#));
+    }
+}
+
+fn sanitize_attachment_dir_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|ch| {
+            !matches!(*ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') && !ch.is_control()
+        })
+        .collect();
+
+    let trimmed = cleaned
+        .trim()
+        .trim_end_matches(|c| c == '.' || c == ' ')
+        .trim();
+
+    if trimmed.is_empty() {
+        "document".to_string()
+    } else {
+        trimmed.chars().take(100).collect()
+    }
+}
+
+fn attachment_root_name(doc_path: &Path) -> String {
+    let name = doc_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("document");
+    format!(".attachment_{}", sanitize_attachment_dir_name(name))
+}
+
+fn attachment_root_dir(doc_path: &Path) -> Result<PathBuf, String> {
+    let doc_dir = doc_path.parent().ok_or("Invalid document path")?;
+    Ok(doc_dir.join(attachment_root_name(doc_path)))
+}
+
+#[cfg(target_os = "windows")]
+fn hide_attachment_dir(path: &Path) {
+    use std::process::Command;
+
+    let _ = Command::new("attrib")
+        .args(&["+H", path.to_str().unwrap_or("")])
+        .output();
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
+    if !source.exists() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(destination).map_err(|e| format!("Failed to create directory: {}", e))?;
+
+    for entry in fs::read_dir(source).map_err(|e| format!("Failed to read directory: {}", e))? {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+
+        if source_path.is_dir() {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else {
+            fs::copy(&source_path, &destination_path)
+                .map_err(|e| format!("Failed to copy file: {}", e))?;
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 fn read_file_content(path: String) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
+fn read_binary_file(path: String) -> Result<Vec<u8>, String> {
+    fs::read(path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn save_file_content(path: String, content: String) -> Result<(), String> {
     fs::write(path, content).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn prepare_save_as_content(
+    source_document_path: String,
+    target_document_path: String,
+    content: String,
+) -> Result<String, String> {
+    let source_doc_path = Path::new(&source_document_path);
+    let target_doc_path = Path::new(&target_document_path);
+
+    let source_root_name = attachment_root_name(source_doc_path);
+    let target_root_name = attachment_root_name(target_doc_path);
+
+    if source_root_name == target_root_name {
+        return Ok(content);
+    }
+
+    let encoded_source_root = urlencoding::encode(&source_root_name).into_owned();
+    let encoded_target_root = urlencoding::encode(&target_root_name).into_owned();
+
+    Ok(content
+        .replace(
+            &format!("{}/", source_root_name),
+            &format!("{}/", encoded_target_root),
+        )
+        .replace(
+            &format!("{}/", encoded_source_root),
+            &format!("{}/", encoded_target_root),
+        ))
+}
+
+#[tauri::command]
+fn copy_attachments_for_save_as(
+    source_document_path: String,
+    target_document_path: String,
+) -> Result<(), String> {
+    let source_doc_path = Path::new(&source_document_path);
+    let target_doc_path = Path::new(&target_document_path);
+
+    let source_root_dir = attachment_root_dir(source_doc_path)?;
+    let target_root_dir = attachment_root_dir(target_doc_path)?;
+
+    if source_root_dir == target_root_dir || !source_root_dir.exists() {
+        return Ok(());
+    }
+
+    copy_dir_recursive(&source_root_dir, &target_root_dir)?;
+
+    #[cfg(target_os = "windows")]
+    hide_attachment_dir(&target_root_dir);
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -142,6 +422,343 @@ fn unwatch_file(state: State<'_, WatcherState>) -> Result<(), String> {
     let mut watcher_lock = state.watcher.lock().unwrap();
     *watcher_lock = None;
     Ok(())
+}
+
+#[tauri::command]
+fn copy_file_to_attachment(
+    source_path: String,
+    document_path: String,
+    target_filename: String,
+    is_image: bool,
+) -> Result<String, String> {
+    // Validate document path
+    let doc_path = Path::new(&document_path);
+    if !doc_path.exists() {
+        return Err("Document must be saved first".to_string());
+    }
+
+    let attach_root_name = attachment_root_name(doc_path);
+    let attach_root = attachment_root_dir(doc_path)?;
+    let attach_dir = if is_image {
+        attach_root.join("images")
+    } else {
+        attach_root.clone()
+    };
+    let subdir = if is_image {
+        format!("{}/images", attach_root_name)
+    } else {
+        attach_root_name.clone()
+    };
+
+    let is_new_folder = !attach_root.exists();
+
+    // Create directory
+    fs::create_dir_all(&attach_dir).map_err(|e| format!("Failed to create directory: {}", e))?;
+
+    // Set hidden attribute on the attachment folder on Windows (only when newly created)
+    #[cfg(target_os = "windows")]
+    if is_new_folder && attach_root.exists() {
+        hide_attachment_dir(&attach_root);
+    }
+
+    // Handle filename conflicts (add counter)
+    let mut target_path = attach_dir.join(&target_filename);
+    let mut counter = 1;
+
+    if target_path.exists() {
+        let stem = Path::new(&target_filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file");
+        let ext = Path::new(&target_filename)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        while target_path.exists() {
+            let new_name = if ext.is_empty() {
+                format!("{}_{}", stem, counter)
+            } else {
+                format!("{}_{}.{}", stem, counter, ext)
+            };
+            target_path = attach_dir.join(new_name);
+            counter += 1;
+        }
+    }
+
+    // Copy file
+    fs::copy(&source_path, &target_path).map_err(|e| format!("Failed to copy file: {}", e))?;
+
+    // Return relative path
+    let filename = target_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("Invalid filename")?;
+    let relative_path = format!("{}/{}", subdir, filename);
+    Ok(relative_path)
+}
+
+fn save_bytes_to_attachment(
+    document_path: String,
+    file_data: Vec<u8>,
+    filename: String,
+    is_image: bool,
+) -> Result<String, String> {
+    let doc_path = Path::new(&document_path);
+    if !doc_path.exists() {
+        return Err("Document must be saved first".to_string());
+    }
+
+    let attach_root_name = attachment_root_name(doc_path);
+    let attach_root = attachment_root_dir(doc_path)?;
+    let attach_dir = if is_image {
+        attach_root.join("images")
+    } else {
+        attach_root.clone()
+    };
+    let subdir = if is_image {
+        format!("{}/images", attach_root_name)
+    } else {
+        attach_root_name.clone()
+    };
+
+    let is_new_folder = !attach_root.exists();
+
+    fs::create_dir_all(&attach_dir).map_err(|e| format!("Failed to create directory: {}", e))?;
+
+    #[cfg(target_os = "windows")]
+    if is_new_folder && attach_root.exists() {
+        hide_attachment_dir(&attach_root);
+    }
+
+    let mut target_path = attach_dir.join(&filename);
+    let mut counter = 1;
+
+    if target_path.exists() {
+        let stem = Path::new(&filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file");
+        let ext = Path::new(&filename)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        while target_path.exists() {
+            let new_name = if ext.is_empty() {
+                format!("{}_{}", stem, counter)
+            } else {
+                format!("{}_{}.{}", stem, counter, ext)
+            };
+            target_path = attach_dir.join(new_name);
+            counter += 1;
+        }
+    }
+
+    fs::write(&target_path, file_data).map_err(|e| format!("Failed to write file: {}", e))?;
+
+    let saved_filename = target_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("Invalid filename")?;
+
+    Ok(format!("{}/{}", subdir, saved_filename))
+}
+
+#[tauri::command]
+fn save_clipboard_file(
+    document_path: String,
+    file_data: Vec<u8>,
+    filename: String,
+    is_image: bool,
+) -> Result<String, String> {
+    save_bytes_to_attachment(document_path, file_data, filename, is_image)
+}
+
+#[tauri::command]
+fn open_file(path: String) -> Result<(), String> {
+    opener::open(path).map_err(|e| format!("Failed to open file: {}", e))
+}
+
+#[tauri::command]
+fn cleanup_unused_attachments(
+    document_path: String,
+    content: String,
+) -> Result<CleanupResult, String> {
+    // Validate document path
+    let doc_path = Path::new(&document_path);
+    if !doc_path.exists() {
+        return Ok(CleanupResult {
+            deleted_count: 0,
+            used_files: vec![],
+            checked_files: vec![],
+        });
+    }
+
+    let doc_dir = doc_path.parent().ok_or("Invalid document path")?;
+    let attach_root_name = attachment_root_name(doc_path);
+    let attach_dir = doc_dir.join(&attach_root_name);
+
+    // If the current document's attachment directory doesn't exist, nothing to clean up
+    if !attach_dir.exists() {
+        return Ok(CleanupResult {
+            deleted_count: 0,
+            used_files: vec![],
+            checked_files: vec![],
+        });
+    }
+
+    fn path_variations(path: &str) -> Vec<String> {
+        fn build_variants(
+            segments: &[&str],
+            index: usize,
+            current: &mut Vec<String>,
+            variants: &mut Vec<String>,
+        ) {
+            if index == segments.len() {
+                variants.push(current.join("/"));
+                return;
+            }
+
+            let raw = segments[index].to_string();
+            current.push(raw.clone());
+            build_variants(segments, index + 1, current, variants);
+            current.pop();
+
+            let encoded = urlencoding::encode(segments[index]).into_owned();
+            if encoded != raw {
+                current.push(encoded);
+                build_variants(segments, index + 1, current, variants);
+                current.pop();
+            }
+        }
+
+        let segments: Vec<&str> = path.split('/').collect();
+        let mut variants = Vec::new();
+        build_variants(&segments, 0, &mut Vec::new(), &mut variants);
+
+        if let Ok(decoded) = urlencoding::decode(path) {
+            let decoded = decoded.into_owned();
+            if !variants.contains(&decoded) {
+                variants.push(decoded.clone());
+            }
+
+            let decoded_segments: Vec<&str> = decoded.split('/').collect();
+            build_variants(&decoded_segments, 0, &mut Vec::new(), &mut variants);
+        }
+
+        variants.sort();
+        variants.dedup();
+        variants
+    }
+
+    fn is_referenced_in_content(content: &str, path: &str) -> bool {
+        let markdown_link = format!("({})", path);
+        let obsidian_embed = format!("[[{}]]", path);
+        let obsidian_sized = format!("[[{}|", path);
+
+        content.contains(&markdown_link)
+            || content.contains(&obsidian_embed)
+            || content.contains(&obsidian_sized)
+    }
+
+    let mut deleted_count = 0;
+    let mut checked_files = Vec::new();
+    let mut used_files = Vec::new();
+
+    fn walk_dir(
+        dir: &Path,
+        base: &Path,
+        content: &str,
+        used: &mut Vec<String>,
+        deleted: &mut usize,
+        checked: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+
+        let entries = fs::read_dir(dir).map_err(|e| format!("Failed to read directory: {}", e))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+            let path = entry.path();
+
+            if path.is_dir() {
+                walk_dir(&path, base, content, used, deleted, checked)?;
+            } else if path.is_file() {
+                let rel_path = path
+                    .strip_prefix(base)
+                    .map_err(|e| format!("Failed to get relative path: {}", e))?;
+                let rel_path_str = rel_path.to_string_lossy().replace("\\", "/");
+
+                checked.push(rel_path_str.clone());
+
+                let is_used = path_variations(&rel_path_str)
+                    .iter()
+                    .any(|variant| is_referenced_in_content(content, variant));
+
+                if is_used {
+                    used.push(rel_path_str);
+                } else if let Err(_e) = fs::remove_file(&path) {
+                    // Ignore deletion errors
+                } else {
+                    *deleted += 1;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    walk_dir(
+        &attach_dir,
+        doc_dir,
+        &content,
+        &mut used_files,
+        &mut deleted_count,
+        &mut checked_files,
+    )?;
+
+    // Clean up empty directories
+    fn remove_empty_dirs(dir: &Path) -> Result<(), String> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+
+        let entries = fs::read_dir(dir).map_err(|e| format!("Failed to read directory: {}", e))?;
+
+        let mut has_files = false;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+            let path = entry.path();
+
+            if path.is_dir() {
+                remove_empty_dirs(&path)?;
+                // Check if dir still exists after recursive cleanup
+                if path.exists() {
+                    has_files = true;
+                }
+            } else {
+                has_files = true;
+            }
+        }
+
+        // Remove directory if empty
+        if !has_files {
+            let _ = fs::remove_dir(dir);
+        }
+
+        Ok(())
+    }
+
+    let _ = remove_empty_dirs(&attach_dir);
+
+    Ok(CleanupResult {
+        deleted_count,
+        used_files,
+        checked_files,
+    })
 }
 
 struct AppState {
@@ -276,6 +893,7 @@ pub fn run() {
         })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             println!("Single Instance Args: {:?}", args);
 
@@ -414,7 +1032,10 @@ pub fn run() {
             render_markdown,
             send_markdown_path,
             read_file_content,
+            read_binary_file,
             save_file_content,
+            prepare_save_as_content,
+            copy_attachments_for_save_as,
             get_app_mode,
             setup::install_app,
             setup::uninstall_app,
@@ -427,7 +1048,11 @@ pub fn run() {
             show_window,
             save_theme,
             get_system_fonts,
-            get_os_type
+            get_os_type,
+            copy_file_to_attachment,
+            save_clipboard_file,
+            open_file,
+            cleanup_unused_attachments,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

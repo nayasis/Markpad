@@ -1,6 +1,7 @@
 <script lang="ts">
 	export type ContextMenuItem = {
 		label?: string;
+		detail?: string;
 		shortcut?: string;
 		disabled?: boolean;
 		onClick?: () => void;
@@ -16,6 +17,7 @@
 	}>();
 
 	let menuEl = $state<HTMLDivElement>();
+	let overlayEl = $state<HTMLDivElement>();
 	let innerWidth = $state(1000);
 	let innerHeight = $state(1000);
 
@@ -36,6 +38,38 @@
 
 	let adjustedX = $derived(menuEl && x + menuEl.offsetWidth > innerWidth ? innerWidth - menuEl.offsetWidth - 8 : x);
 	let adjustedY = $derived(menuEl && y + menuEl.offsetHeight > innerHeight ? innerHeight - menuEl.offsetHeight - 8 : y);
+
+	function handleOverlayContextMenu(e: MouseEvent) {
+		e.preventDefault();
+		e.stopPropagation();
+
+		if (!overlayEl) {
+			onhide();
+			return;
+		}
+
+		overlayEl.style.pointerEvents = 'none';
+		const nextTarget = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+		overlayEl.style.pointerEvents = '';
+
+		onhide();
+
+		if (!nextTarget) return;
+
+		requestAnimationFrame(() => {
+			nextTarget.dispatchEvent(
+				new MouseEvent('contextmenu', {
+					bubbles: true,
+					cancelable: true,
+					clientX: e.clientX,
+					clientY: e.clientY,
+					button: 2,
+					buttons: 2,
+					view: window,
+				}),
+			);
+		});
+	}
 </script>
 
 <svelte:window bind:innerWidth bind:innerHeight />
@@ -43,7 +77,7 @@
 {#if show}
 	<!-- svelte-ignore a11y_click_events_have_key_events -->
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="context-menu-overlay" onclick={onhide} oncontextmenu={(e) => { e.preventDefault(); onhide(); }}>
+	<div class="context-menu-overlay" bind:this={overlayEl} onclick={onhide} oncontextmenu={handleOverlayContextMenu}>
 		<div
 			class="context-menu show-dropdown"
 			bind:this={menuEl}
@@ -66,7 +100,12 @@
 								onhide();
 							}
 						}}>
-						<span class="action-label">{item.label}</span>
+						<div class="menu-labels">
+							<span class="action-label">{item.label}</span>
+							{#if item.detail}
+								<span class="menu-detail" title={item.detail}>{item.detail}</span>
+							{/if}
+						</div>
 						{#if item.shortcut}
 							<span class="menu-shortcut">{item.shortcut}</span>
 						{/if}
@@ -133,6 +172,14 @@
 		gap: 16px;
 	}
 
+	.menu-labels {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 2px;
+		min-width: 0;
+	}
+
 	.menu-item:hover:not(:disabled) {
 		background: var(--color-neutral-muted);
 	}
@@ -145,6 +192,17 @@
 		display: block;
 		text-align: left;
 		white-space: nowrap;
+	}
+
+	.menu-detail {
+		display: block;
+		font-size: 11px;
+		line-height: 1.3;
+		color: var(--color-fg-muted);
+		white-space: normal;
+		word-break: break-all;
+		text-align: left;
+		max-width: 320px;
 	}
 
 	.menu-shortcut {
