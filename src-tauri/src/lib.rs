@@ -27,9 +27,10 @@ async fn show_window(window: tauri::Window) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ImageSizeSpec<'a> {
+struct EmbedOptions<'a> {
     width: Option<&'a str>,
     height: Option<&'a str>,
+    pdf_hidden: bool,
 }
 
 fn escape_html_attr(value: &str) -> String {
@@ -40,7 +41,7 @@ fn escape_html_attr(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn parse_image_size_spec(value: &str) -> Option<ImageSizeSpec<'_>> {
+fn parse_image_size_spec(value: &str) -> Option<(Option<&str>, Option<&str>)> {
     fn parse_dimension(dimension: &str) -> Option<Option<&str>> {
         let dimension = dimension.trim();
         if dimension.is_empty() {
@@ -64,27 +65,101 @@ fn parse_image_size_spec(value: &str) -> Option<ImageSizeSpec<'_>> {
         if width.is_none() && height.is_none() {
             None
         } else {
-            Some(ImageSizeSpec { width, height })
+            Some((width, height))
         }
     } else {
         let width = parse_dimension(trimmed)?;
-        width.map(|width| ImageSizeSpec {
-            width: Some(width),
-            height: None,
-        })
+        width.map(|width| (Some(width), None))
     }
 }
 
-fn build_image_tag(path: &str, alt: &str, size: Option<ImageSizeSpec<'_>>) -> String {
-    let mut attributes = vec![format!(r#"src="{}""#, escape_html_attr(&path.replace(' ', "%20")))];
+fn parse_embed_options(value: &str) -> Option<EmbedOptions<'_>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
 
-    if let Some(size) = size {
-        if let Some(width) = size.width {
+    let mut parts: Vec<&str> = trimmed.split('|').map(str::trim).collect();
+    let pdf_hidden = parts
+        .last()
+        .is_some_and(|part| part.eq_ignore_ascii_case("hidden"));
+
+    if pdf_hidden {
+        parts.pop();
+    }
+
+    let (width, height) = if let Some(size_part) = parts.pop() {
+        parse_image_size_spec(size_part)?
+    } else if pdf_hidden {
+        (None, None)
+    } else {
+        return None;
+    };
+
+    Some(EmbedOptions {
+        width,
+        height,
+        pdf_hidden,
+    })
+}
+
+fn parse_markdown_alt_options(alt: &str) -> Option<(String, EmbedOptions<'_>)> {
+    let mut parts: Vec<&str> = alt.split('|').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let pdf_hidden = parts
+        .last()
+        .is_some_and(|part| part.trim().eq_ignore_ascii_case("hidden"));
+
+    if pdf_hidden {
+        parts.pop();
+    }
+
+    let mut width = None;
+    let mut height = None;
+    if parts.len() >= 2 {
+        if let Some((parsed_width, parsed_height)) = parse_image_size_spec(parts.last().unwrap()) {
+            width = parsed_width;
+            height = parsed_height;
+            parts.pop();
+        } else if !pdf_hidden {
+            return None;
+        }
+    }
+
+    if !pdf_hidden && width.is_none() && height.is_none() {
+        return None;
+    }
+
+    Some((
+        parts.join("|"),
+        EmbedOptions {
+            width,
+            height,
+            pdf_hidden,
+        },
+    ))
+}
+
+fn build_image_tag(path: &str, alt: &str, options: Option<EmbedOptions<'_>>) -> String {
+    let mut attributes = vec![format!(
+        r#"src="{}""#,
+        escape_html_attr(&path.replace(' ', "%20"))
+    )];
+
+    if let Some(options) = options {
+        if let Some(width) = options.width {
             attributes.push(format!(r#"width="{}""#, width));
         }
 
-        if let Some(height) = size.height {
+        if let Some(height) = options.height {
             attributes.push(format!(r#"height="{}""#, height));
+        }
+
+        if options.pdf_hidden {
+            attributes.push(r#"data-pdf-hidden="true""#.to_string());
         }
     }
 
@@ -100,9 +175,9 @@ fn process_obsidian_embeds(content: &str) -> Cow<'_, str> {
         let inner = &caps[1];
         let mut parts = inner.splitn(2, '|');
         let path = parts.next().unwrap_or("").trim();
-        let size = parts.next().and_then(parse_image_size_spec);
+        let options = parts.next().and_then(parse_embed_options);
 
-        build_image_tag(path, path, size)
+        build_image_tag(path, path, options)
     })
 }
 
@@ -124,13 +199,7 @@ fn process_markdown_image_sizes(html: &str) -> Cow<'_, str> {
         };
 
         let alt = alt_caps.name("alt").unwrap().as_str();
-        let Some(pipe_index) = alt.rfind('|') else {
-            return full.to_string();
-        };
-
-        let actual_alt = &alt[..pipe_index];
-        let size = &alt[pipe_index + 1..];
-        let Some(size) = parse_image_size_spec(size) else {
+        let Some((actual_alt, options)) = parse_markdown_alt_options(alt) else {
             return full.to_string();
         };
 
@@ -140,12 +209,16 @@ fn process_markdown_image_sizes(html: &str) -> Cow<'_, str> {
             1,
         );
 
-        if let Some(width) = size.width {
+        if let Some(width) = options.width {
             new_attrs.push_str(&format!(r#" width="{}""#, width));
         }
 
-        if let Some(height) = size.height {
+        if let Some(height) = options.height {
             new_attrs.push_str(&format!(r#" height="{}""#, height));
+        }
+
+        if options.pdf_hidden {
+            new_attrs.push_str(r#" data-pdf-hidden="true""#);
         }
 
         format!("<img{} />", new_attrs)
@@ -239,6 +312,29 @@ mod tests {
         assert!(html.contains(r#"alt="foo|bar""#));
         assert!(html.contains(r#"width="320""#));
         assert!(!html.contains(r#"alt="foo|bar|320""#));
+    }
+
+    #[test]
+    fn renders_markdown_pdf_with_size_and_hidden_flag() {
+        let html = convert_markdown("![sample|600x800|hidden](sample.pdf)");
+
+        assert!(html.contains(r#"src="sample.pdf""#));
+        assert!(html.contains(r#"alt="sample""#));
+        assert!(html.contains(r#"width="600""#));
+        assert!(html.contains(r#"height="800""#));
+        assert!(html.contains(r#"data-pdf-hidden="true""#));
+        assert!(!html.contains(r#"alt="sample|600x800|hidden""#));
+    }
+
+    #[test]
+    fn renders_obsidian_pdf_embed_with_size_and_hidden_flag() {
+        let html = convert_markdown("![[sample.pdf|600x800|hidden]]");
+
+        assert!(html.contains(r#"src="sample.pdf""#));
+        assert!(html.contains(r#"alt="sample.pdf""#));
+        assert!(html.contains(r#"width="600""#));
+        assert!(html.contains(r#"height="800""#));
+        assert!(html.contains(r#"data-pdf-hidden="true""#));
     }
 }
 

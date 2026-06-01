@@ -316,6 +316,72 @@ body {
 	border-radius: 8px;
 }
 
+.markdown-body .markdown-pdf-embed {
+	width: 100%;
+	max-width: 100%;
+	margin: 1em 0;
+	border: 1px solid var(--color-border-default);
+	border-radius: 8px;
+	overflow: hidden;
+	background: var(--color-canvas-subtle);
+	box-sizing: border-box;
+}
+
+.markdown-body .markdown-pdf-toolbar {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 8px 10px;
+	border-bottom: 1px solid var(--color-border-default);
+	background: var(--color-canvas-default);
+}
+
+.markdown-body .markdown-pdf-title {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--color-fg-default);
+	font-size: 13px;
+	font-weight: 600;
+}
+
+.markdown-body .markdown-pdf-actions {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	flex-shrink: 0;
+}
+
+.markdown-body .markdown-pdf-actions button {
+	height: 26px;
+	padding: 0 8px;
+	border: 1px solid var(--color-border-default);
+	border-radius: 4px;
+	background: var(--color-canvas-default);
+	color: var(--color-fg-default);
+	font: inherit;
+	font-size: 12px;
+	cursor: pointer;
+}
+
+.markdown-body .markdown-pdf-actions button:hover {
+	background: var(--color-neutral-muted);
+}
+
+.markdown-body .markdown-pdf-frame {
+	display: block;
+	width: 100%;
+	height: var(--pdf-height, 720px);
+	border: 0;
+	background: var(--color-canvas-default);
+}
+
+.markdown-body .markdown-pdf-collapsed .markdown-pdf-frame {
+	display: none;
+}
+
 .markdown-body code,
 .markdown-body kbd,
 .markdown-body pre,
