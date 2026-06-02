@@ -268,9 +268,15 @@
 			}
 
 			if (src) {
-				const ext = src.split('.').pop()?.toLowerCase();
+				const isPdf = isPdfPath(src);
+				const ext = src.split('#')[0].split('?')[0].split('.').pop()?.toLowerCase();
 				const isVideo = ['mp4', 'webm', 'ogg', 'mov'].includes(ext || '');
 				const isAudio = ['mp3', 'wav', 'aac', 'flac', 'm4a'].includes(ext || '');
+
+				if (isPdf) {
+					replaceWithPdfEmbed(img, finalSrc || '', src);
+					continue;
+				}
 
 				if (isVideo || isAudio) {
 					const media = doc.createElement(isVideo ? 'video' : 'audio');
@@ -312,6 +318,11 @@
 				if (parent && (parent.tagName === 'P' || parent.tagName === 'DIV') && parent.childNodes.length === 1) {
 					const videoId = getYoutubeId(href);
 					if (videoId) replaceWithYoutubeEmbed(a, videoId);
+				}
+			} else if (href && isPdfPath(href)) {
+				const parent = a.parentElement;
+				if (parent && (parent.tagName === 'P' || parent.tagName === 'DIV') && parent.childNodes.length === 1) {
+					replacePdfLinkWithEmbed(a, resolvedPath ? convertFileSrc(resolvedPath) : href, href, parent);
 				}
 			}
 		}
@@ -582,6 +593,7 @@
 		});
 
 		refreshPreviewImageObservers();
+		attachPdfEmbedHandlers();
 		scheduleScrollSyncRefresh();
 	}
 
@@ -620,17 +632,18 @@
 
 		if (!markdownBody || typeof ResizeObserver === 'undefined') return;
 
-		const images = Array.from(markdownBody.querySelectorAll('img'));
-		if (!images.length) return;
+		const resizeTargets = Array.from(markdownBody.querySelectorAll('img, .markdown-pdf-embed'));
+		if (!resizeTargets.length) return;
 
 		previewImageResizeObserver = new ResizeObserver(() => {
 			scheduleScrollSyncRefresh();
 		});
 
-		for (const image of images) {
-			previewImageResizeObserver.observe(image);
+		for (const target of resizeTargets) {
+			previewImageResizeObserver.observe(target);
 
-			if (!image.complete) {
+			if (target instanceof HTMLImageElement && !target.complete) {
+				const image = target;
 				image.addEventListener('load', () => scheduleScrollSyncRefresh(), { once: true });
 				image.addEventListener('error', () => scheduleScrollSyncRefresh(), { once: true });
 			}
@@ -1105,6 +1118,10 @@
 		return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext || '');
 	}
 
+	function isPdfFile(filename: string): boolean {
+		return filename.split('.').pop()?.toLowerCase() === 'pdf';
+	}
+
 	function sanitizeFilename(filename: string): string {
 		const basename = filename.split(/[/\\]/).pop() || 'file';
 
@@ -1145,6 +1162,7 @@
 			try {
 				const originalFilename = sourcePath.split(/[/\\]/).pop() || 'file';
 				const isImage = isImageFile(originalFilename);
+				const isPdf = isPdfFile(originalFilename);
 				const targetFilename = sanitizeFilename(originalFilename);
 
 				const relativePath = await invoke<string>('copy_file_to_attachment', {
@@ -1158,7 +1176,7 @@
 				// Use original filename for alt text (remove extension)
 				const nameWithoutExt = originalFilename.replace(/\.[^/.]+$/, '');
 
-				const text = isImage
+				const text = isImage || isPdf
 					? `![${nameWithoutExt}](${markdownPath})`
 					: `[${originalFilename}](${markdownPath})`;
 
@@ -1214,6 +1232,10 @@
 		return match && match[2].length === 11 ? match[2] : null;
 	}
 
+	function isPdfPath(path: string | null) {
+		return path?.split('#')[0].split('?')[0].split('.').pop()?.toLowerCase() === 'pdf';
+	}
+
 	function replaceWithYoutubeEmbed(element: Element, videoId: string) {
 		const container = element.ownerDocument.createElement('div');
 		container.className = 'video-container';
@@ -1225,6 +1247,185 @@
 		iframe.allowFullscreen = true;
 		container.appendChild(iframe);
 		element.replaceWith(container);
+	}
+
+	function appendPdfActionButton(actions: HTMLElement, action: string, label: string) {
+		const button = actions.ownerDocument.createElement('button');
+		button.type = 'button';
+		button.dataset.pdfAction = action;
+		button.textContent = label;
+		actions.appendChild(button);
+	}
+
+	function appendPdfToolbarActions(actions: HTMLElement, toggleLabel: string) {
+		for (const [action, label] of [
+			['toggle', toggleLabel],
+			['open', 'Open'],
+			['copy-path', 'Copy Path'],
+		]) {
+			appendPdfActionButton(actions, action, label);
+		}
+	}
+
+	function replaceWithPdfEmbed(image: HTMLImageElement, pdfSrc: string, originalSrc: string) {
+		const doc = image.ownerDocument;
+		const container = doc.createElement('div');
+		container.className = 'markdown-pdf-embed';
+		container.dataset.pdfSrc = pdfSrc;
+
+		const localPath = image.dataset.localPath;
+		if (localPath) container.dataset.localPath = localPath;
+		if (image.dataset.sourcepos) container.dataset.sourcepos = image.dataset.sourcepos;
+		if (image.getAttribute('data-pdf-hidden') === 'true') {
+			container.classList.add('markdown-pdf-collapsed');
+		}
+
+		const width = image.getAttribute('width');
+		const height = image.getAttribute('height');
+		if (width) container.style.width = `${width}px`;
+		if (height) container.style.setProperty('--pdf-height', `${height}px`);
+
+		const title = image.getAttribute('alt') || originalSrc.split(/[/\\]/).pop() || 'PDF';
+
+		const toolbar = doc.createElement('div');
+		toolbar.className = 'markdown-pdf-toolbar';
+
+		const titleEl = doc.createElement('span');
+		titleEl.className = 'markdown-pdf-title';
+		titleEl.textContent = title;
+		toolbar.appendChild(titleEl);
+
+		const actions = doc.createElement('div');
+		actions.className = 'markdown-pdf-actions';
+
+		appendPdfToolbarActions(actions, container.classList.contains('markdown-pdf-collapsed') ? 'Show PDF' : 'Hide PDF');
+
+		toolbar.appendChild(actions);
+		container.appendChild(toolbar);
+
+		const frame = doc.createElement('iframe');
+		frame.className = 'markdown-pdf-frame';
+		frame.src = pdfSrc;
+		frame.title = title;
+		frame.loading = 'lazy';
+		container.appendChild(frame);
+
+		image.replaceWith(container);
+	}
+
+	function replacePdfLinkWithEmbed(anchor: HTMLAnchorElement, pdfSrc: string, originalSrc: string, replaceTarget: Element) {
+		const doc = anchor.ownerDocument;
+		const container = doc.createElement('div');
+		container.className = 'markdown-pdf-embed';
+		container.dataset.pdfSrc = pdfSrc;
+
+		const localPath = anchor.dataset.localPath;
+		if (localPath) container.dataset.localPath = localPath;
+		if ((replaceTarget as HTMLElement).dataset.sourcepos) {
+			container.dataset.sourcepos = (replaceTarget as HTMLElement).dataset.sourcepos;
+		}
+
+		const title = anchor.textContent?.trim() || originalSrc.split(/[/\\]/).pop() || 'PDF';
+
+		const toolbar = doc.createElement('div');
+		toolbar.className = 'markdown-pdf-toolbar';
+
+		const titleEl = doc.createElement('span');
+		titleEl.className = 'markdown-pdf-title';
+		titleEl.textContent = title;
+		toolbar.appendChild(titleEl);
+
+		const actions = doc.createElement('div');
+		actions.className = 'markdown-pdf-actions';
+
+		appendPdfToolbarActions(actions, 'Hide PDF');
+
+		toolbar.appendChild(actions);
+		container.appendChild(toolbar);
+
+		const frame = doc.createElement('iframe');
+		frame.className = 'markdown-pdf-frame';
+		frame.src = pdfSrc;
+		frame.title = title;
+		frame.loading = 'lazy';
+		container.appendChild(frame);
+
+		replaceTarget.replaceWith(container);
+	}
+
+	function attachPdfEmbedHandlers() {
+		if (!markdownBody) return;
+
+		for (const embed of Array.from(markdownBody.querySelectorAll('.markdown-pdf-embed'))) {
+			const container = embed as HTMLElement;
+			const frame = container.querySelector('iframe.markdown-pdf-frame') as HTMLIFrameElement | null;
+			const toggleButton = container.querySelector('[data-pdf-action="toggle"]') as HTMLButtonElement | null;
+			const openButton = container.querySelector('[data-pdf-action="open"]') as HTMLButtonElement | null;
+			const copyPathButton = container.querySelector('[data-pdf-action="copy-path"]') as HTMLButtonElement | null;
+
+			const syncToggleLabel = () => {
+				if (!toggleButton) return;
+				const collapsed = container.classList.contains('markdown-pdf-collapsed');
+				toggleButton.textContent = collapsed ? 'Show PDF' : 'Hide PDF';
+				toggleButton.setAttribute('aria-expanded', String(!collapsed));
+			};
+
+			if (toggleButton) {
+				const oldHandler = (toggleButton as any)._pdfClickHandler;
+				if (oldHandler) toggleButton.removeEventListener('click', oldHandler);
+
+				const handler = () => {
+					container.classList.toggle('markdown-pdf-collapsed');
+					syncToggleLabel();
+					scheduleScrollSyncRefresh();
+				};
+				toggleButton.addEventListener('click', handler);
+				(toggleButton as any)._pdfClickHandler = handler;
+				syncToggleLabel();
+			}
+
+			if (openButton) {
+				const oldHandler = (openButton as any)._pdfClickHandler;
+				if (oldHandler) openButton.removeEventListener('click', oldHandler);
+
+				const handler = async () => {
+					const localPath = container.dataset.localPath;
+					try {
+						if (localPath) {
+							await invoke('open_file', { path: localPath });
+						} else if (container.dataset.pdfSrc) {
+							await openUrl(container.dataset.pdfSrc);
+						}
+					} catch (error) {
+						console.error('Failed to open PDF:', error);
+						await askCustom(`Failed to open PDF: ${error}`, { title: 'Error', kind: 'error' });
+					}
+				};
+				openButton.addEventListener('click', handler);
+				(openButton as any)._pdfClickHandler = handler;
+			}
+
+			if (copyPathButton) {
+				const oldHandler = (copyPathButton as any)._pdfClickHandler;
+				if (oldHandler) copyPathButton.removeEventListener('click', oldHandler);
+
+				const handler = () => {
+					const path = container.dataset.localPath || container.dataset.pdfSrc;
+					if (path) void copyPathToClipboard(path);
+				};
+				copyPathButton.addEventListener('click', handler);
+				(copyPathButton as any)._pdfClickHandler = handler;
+			}
+
+			if (frame) {
+				const oldHandler = (frame as any)._pdfLoadHandler;
+				if (oldHandler) frame.removeEventListener('load', oldHandler);
+
+				const handler = () => scheduleScrollSyncRefresh();
+				frame.addEventListener('load', handler);
+				(frame as any)._pdfLoadHandler = handler;
+			}
+		}
 	}
 
 	async function canCloseTab(tabId: string): Promise<boolean> {
@@ -1431,6 +1632,17 @@
 		return current?.tagName === 'A' ? (current as HTMLAnchorElement) : null;
 	}
 
+	function findContextMenuPdfEmbed(target: EventTarget | null): HTMLElement | null {
+		let current = target instanceof HTMLElement ? target : null;
+		while (current && current !== document.body) {
+			if (current.classList.contains('markdown-pdf-embed')) {
+				return current;
+			}
+			current = current.parentElement;
+		}
+		return null;
+	}
+
 	function resolveLocalTargetPath(rawPath: string | null, basePath = currentFile): string | null {
 		if (!rawPath || !basePath) return null;
 		if (rawPath.startsWith('#') || rawPath.startsWith('data:') || rawPath.match(/^[a-z]+:\/\//i)) return null;
@@ -1447,6 +1659,10 @@
 
 		const targetMedia = findContextMenuMedia(target);
 		if (targetMedia?.dataset.localPath) return targetMedia.dataset.localPath;
+
+		const targetPdf = findContextMenuPdfEmbed(target);
+		if (targetPdf?.dataset.localPath) return targetPdf.dataset.localPath;
+		if (targetPdf?.dataset.pdfSrc) return targetPdf.dataset.pdfSrc;
 
 		const targetAnchor = findContextMenuAnchor(target);
 		if (targetAnchor) {
@@ -1609,7 +1825,7 @@
 		}
 	}
 
-	let debounceTimer: number;
+	let debounceTimer: ReturnType<typeof setTimeout>;
 
 	$effect(() => {
 		const tab = tabManager.activeTab;

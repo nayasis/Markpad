@@ -103,6 +103,10 @@
 		return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext || '');
 	}
 
+	function isPdfFile(filename: string): boolean {
+		return filename.split('.').pop()?.toLowerCase() === 'pdf';
+	}
+
 	function sanitizeFilename(filename: string): string {
 		const basename = filename.split(/[/\\]/).pop() || 'file';
 
@@ -134,8 +138,8 @@
 
 	function toAttachmentMarkdown(relativePath: string, filename: string, isImage: boolean): string {
 		const markdownPath = encodeMarkdownPath(relativePath);
-		if (isImage) {
-			const altText = filename.replace(/\.[^/.]+$/, '') || 'image';
+		if (isImage || isPdfFile(filename)) {
+			const altText = filename.replace(/\.[^/.]+$/, '') || (isImage ? 'image' : 'pdf');
 			return `![${altText}](${markdownPath})`;
 		}
 		return `[${filename}](${markdownPath})`;
