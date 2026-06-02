@@ -1,11 +1,15 @@
 use comrak::{markdown_to_html, ComrakExtensionOptions, ComrakOptions};
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::{Captures, Regex};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Serialize)]
@@ -15,8 +19,30 @@ struct CleanupResult {
     checked_files: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileChangeStamp {
+    exists: bool,
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+struct PollingWatcher {
+    stop: Arc<AtomicBool>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl PollingWatcher {
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.join();
+        }
+    }
+}
+
 struct WatcherState {
-    watcher: Mutex<Option<RecommendedWatcher>>,
+    watcher: Mutex<Option<PollingWatcher>>,
 }
 
 mod setup;
@@ -93,6 +119,67 @@ fn build_image_tag(path: &str, alt: &str, size: Option<ImageSizeSpec<'_>>) -> St
     format!("<img {} />", attributes.join(" "))
 }
 
+fn read_file_change_stamp(path: &Path) -> FileChangeStamp {
+    match fs::metadata(path) {
+        Ok(metadata) => FileChangeStamp {
+            exists: true,
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        },
+        Err(_) => FileChangeStamp {
+            exists: false,
+            modified: None,
+            len: 0,
+        },
+    }
+}
+
+fn replace_watcher(state: &WatcherState, next_watcher: Option<PollingWatcher>) {
+    let previous = {
+        let mut watcher_lock = state.watcher.lock().unwrap();
+        watcher_lock.take()
+    };
+
+    if let Some(previous) = previous {
+        previous.stop();
+    }
+
+    if let Some(next_watcher) = next_watcher {
+        let mut watcher_lock = state.watcher.lock().unwrap();
+        *watcher_lock = Some(next_watcher);
+    }
+}
+
+fn spawn_polling_watcher(handle: AppHandle, path: String) -> PollingWatcher {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let watched_path = PathBuf::from(&path);
+    let event_path = path;
+
+    let join_handle = thread::spawn(move || {
+        let mut previous = read_file_change_stamp(&watched_path);
+
+        while !thread_stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(500));
+
+            if thread_stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let current = read_file_change_stamp(&watched_path);
+            if current != previous {
+                previous = current;
+                let _ = handle.emit("file-changed", event_path.clone());
+            }
+        }
+    });
+
+    PollingWatcher {
+        stop,
+        join_handle: Some(join_handle),
+    }
+}
+
 fn process_obsidian_embeds(content: &str) -> Cow<'_, str> {
     let re = Regex::new(r"!\[\[(.*?)\]\]").unwrap();
 
@@ -154,7 +241,7 @@ fn process_markdown_image_sizes(html: &str) -> Cow<'_, str> {
 
 #[tauri::command]
 fn convert_markdown(content: &str) -> String {
-    let processed = process_obsidian_embeds(content);
+    let processed = normalize_indented_fenced_code_blocks(&process_obsidian_embeds(content));
 
     let mut options = ComrakOptions {
         extension: ComrakExtensionOptions {
@@ -178,6 +265,89 @@ fn convert_markdown(content: &str) -> String {
     process_markdown_image_sizes(&html).into_owned()
 }
 
+fn indentation_width(value: &str) -> usize {
+    value
+        .chars()
+        .map(|ch| if ch == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+fn split_leading_indent(line: &str) -> (&str, &str) {
+    let index = line
+        .char_indices()
+        .find(|(_, ch)| *ch != ' ' && *ch != '\t')
+        .map(|(index, _)| index)
+        .unwrap_or(line.len());
+
+    (&line[..index], &line[index..])
+}
+
+fn parse_fence_marker(line: &str) -> Option<(char, usize)> {
+    let marker = line.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+
+    let count = line.chars().take_while(|ch| *ch == marker).count();
+    if count < 3 {
+        return None;
+    }
+
+    Some((marker, count))
+}
+
+fn is_fence_end(line: &str, marker: char, minimum_count: usize) -> bool {
+    let (indent, trimmed) = split_leading_indent(line);
+    if indentation_width(indent) > 3 {
+        return false;
+    }
+
+    let count = trimmed.chars().take_while(|ch| *ch == marker).count();
+    count >= minimum_count && trimmed[count..].trim().is_empty()
+}
+
+fn normalize_indented_fenced_code_blocks(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut normalized = Vec::with_capacity(lines.len());
+    let mut index = 0;
+
+    while index < lines.len() {
+        let line = lines[index];
+        let (indent, trimmed) = split_leading_indent(line);
+
+        if indentation_width(indent) >= 4 && parse_fence_marker(trimmed).is_some() {
+            let indent_prefix = indent.to_string();
+            let (marker, minimum_count) = parse_fence_marker(trimmed).unwrap();
+            normalized.push(trimmed.to_string());
+            index += 1;
+
+            while index < lines.len() {
+                let current = lines[index];
+                let dedented = current.strip_prefix(&indent_prefix).unwrap_or(current);
+                normalized.push(dedented.to_string());
+
+                if is_fence_end(dedented, marker, minimum_count) {
+                    index += 1;
+                    break;
+                }
+
+                index += 1;
+            }
+
+            continue;
+        }
+
+        normalized.push(line.to_string());
+        index += 1;
+    }
+
+    let mut output = normalized.join("\n");
+    if content.ends_with('\n') {
+        output.push('\n');
+    }
+    output
+}
+
 #[tauri::command]
 fn open_markdown(path: String) -> Result<String, String> {
     let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
@@ -191,7 +361,13 @@ fn render_markdown(content: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::convert_markdown;
+    use super::{
+        convert_markdown, normalize_indented_fenced_code_blocks, read_file_change_stamp,
+    };
+    use std::{
+        env, fs, thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn renders_obsidian_embed_with_width() {
@@ -239,6 +415,62 @@ mod tests {
         assert!(html.contains(r#"alt="foo|bar""#));
         assert!(html.contains(r#"width="320""#));
         assert!(!html.contains(r#"alt="foo|bar|320""#));
+    }
+
+    #[test]
+    fn normalizes_indented_fenced_code_blocks() {
+        let normalized = normalize_indented_fenced_code_blocks(
+            "    ```powershell\n    # Install Node.js\n    winget install OpenJS.NodeJS\n    ```\n",
+        );
+
+        assert_eq!(
+            normalized,
+            "```powershell\n# Install Node.js\nwinget install OpenJS.NodeJS\n```\n"
+        );
+    }
+
+    #[test]
+    fn renders_indented_fenced_code_blocks_with_language() {
+        let html = convert_markdown(
+            "    ```powershell\n    # Install Node.js\n    winget install OpenJS.NodeJS\n    ```\n",
+        );
+
+        assert!(html.contains(r#"class="language-powershell""#));
+        assert!(html.contains("winget install OpenJS.NodeJS"));
+    }
+
+    #[test]
+    fn file_change_stamp_changes_when_file_content_changes() {
+        let path = unique_test_path("watch-change");
+        fs::write(&path, "old").unwrap();
+
+        let initial = read_file_change_stamp(&path);
+
+        thread::sleep(Duration::from_millis(20));
+        fs::write(&path, "new content").unwrap();
+
+        let updated = read_file_change_stamp(&path);
+
+        assert_ne!(initial, updated);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_change_stamp_reports_missing_file() {
+        let path = unique_test_path("watch-missing");
+
+        let stamp = read_file_change_stamp(&path);
+
+        assert!(!stamp.exists);
+    }
+
+    fn unique_test_path(label: &str) -> std::path::PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("markpad-{label}-{suffix}.md"))
     }
 }
 
@@ -391,36 +623,14 @@ fn watch_file(
     state: State<'_, WatcherState>,
     path: String,
 ) -> Result<(), String> {
-    let mut watcher_lock = state.watcher.lock().unwrap();
-
-    *watcher_lock = None;
-
-    let path_to_watch = path.clone();
-    let app_handle = handle.clone();
-
-    let mut watcher = RecommendedWatcher::new(
-        move |res: Result<notify::Event, notify::Error>| {
-            if let Ok(_) = res {
-                let _ = app_handle.emit("file-changed", ());
-            }
-        },
-        Config::default(),
-    )
-    .map_err(|e| e.to_string())?;
-
-    watcher
-        .watch(Path::new(&path_to_watch), RecursiveMode::NonRecursive)
-        .map_err(|e| e.to_string())?;
-
-    *watcher_lock = Some(watcher);
-
+    let watcher = spawn_polling_watcher(handle, path);
+    replace_watcher(&state, Some(watcher));
     Ok(())
 }
 
 #[tauri::command]
 fn unwatch_file(state: State<'_, WatcherState>) -> Result<(), String> {
-    let mut watcher_lock = state.watcher.lock().unwrap();
-    *watcher_lock = None;
+    replace_watcher(&state, None);
     Ok(())
 }
 

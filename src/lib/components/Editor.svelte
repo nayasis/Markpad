@@ -14,6 +14,8 @@
 	import cssWorker from 'monaco-editor/esm/vs/language/css/css.worker?worker';
 	import htmlWorker from 'monaco-editor/esm/vs/language/html/html.worker?worker';
 	import tsWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker';
+	import { conf as markdownConf, language as markdownLanguage } from 'monaco-editor/esm/vs/basic-languages/markdown/markdown.js';
+	import { conf as shellConf, language as shellLanguage } from 'monaco-editor/esm/vs/basic-languages/shell/shell.js';
 	import { initVimMode } from 'monaco-vim';
 
 	type ScrollSyncState = {
@@ -161,6 +163,40 @@
 		},
 	};
 
+	function registerShellFenceAlias(id: string) {
+		if (!monaco.languages.getLanguages().some((language) => language.id === id)) {
+			monaco.languages.register({ id });
+		}
+
+		monaco.languages.setLanguageConfiguration(id, shellConf as monaco.languages.LanguageConfiguration);
+		monaco.languages.setMonarchTokensProvider(id, shellLanguage as monaco.languages.IMonarchLanguage);
+	}
+
+	function createPatchedMarkdownLanguage(): monaco.languages.IMonarchLanguage {
+		return {
+			...markdownLanguage,
+			tokenizer: {
+				...markdownLanguage.tokenizer,
+				root: [
+					[/^\s*\|/, '@rematch', '@table_header'],
+					[/^(\s{0,3})(#+)((?:[^\\#]|@escapes)+)((?:#+)?)/, ['white', 'keyword', 'keyword', 'keyword']],
+					[/^\s*(=+|\-+)\s*$/, 'keyword'],
+					[/^\s*((\*[ ]?)+)\s*$/, 'meta.separator'],
+					[/^\s*>+/, 'comment'],
+					[/^\s*([\*\-+:]|\d+\.)\s/, 'keyword'],
+					[/^\s*~~~\s*((?:\w|[\/\-#])+)?\s*$/, { token: 'string', next: '@codeblock' }],
+					[
+						/^\s*```\s*((?:\w|[\/\-#])+).*$/,
+						{ token: 'string', next: '@codeblockgh', nextEmbedded: '$1' }
+					],
+					[/^\s*```\s*$/, { token: 'string', next: '@codeblock' }],
+					[/^(\t|[ ]{4})[^ ].*$/, 'string'],
+					{ include: '@linecontent' }
+				]
+			}
+		} as monaco.languages.IMonarchLanguage;
+	}
+
 	onMount(() => {
 		const defineThemes = () => {
 			monaco.editor.defineTheme('app-theme-dark', {
@@ -183,6 +219,12 @@
 		};
 
 		defineThemes();
+		registerShellFenceAlias('bash');
+		registerShellFenceAlias('sh');
+		registerShellFenceAlias('zsh');
+		registerShellFenceAlias('shellscript');
+		monaco.languages.setLanguageConfiguration('markdown', markdownConf as monaco.languages.LanguageConfiguration);
+		monaco.languages.setMonarchTokensProvider('markdown', createPatchedMarkdownLanguage());
 
 		const getTheme = () => {
 			if (theme === 'system') {
@@ -198,7 +240,8 @@
 			dragAndDrop: true,
 			automaticLayout: true,
 			minimap: { enabled: settings.minimap },
-			scrollBeyondLastLine: false,
+			// Leave extra bottom slack so linked scrolling can keep tracking near EOF.
+			scrollBeyondLastLine: true,
 			wordWrap: settings.wordWrap as 'on' | 'off' | 'wordWrapColumn' | 'bounded',
 			lineNumbers: settings.lineNumbers as 'on' | 'off' | 'relative' | 'interval',
 			renderLineHighlight: settings.renderLineHighlight ? 'line' : 'none',
@@ -791,53 +834,6 @@
 		};
 	}
 
-	function getCursorScrollSyncState(
-		position: monaco.Position | null = editor?.getPosition() ?? null,
-		mode: 'center' | 'viewport' = 'center'
-	): ScrollSyncState | null {
-		if (!editor || !position) return null;
-
-		const model = editor.getModel();
-		if (!model) return null;
-
-		const line = Math.max(1, Math.min(model.getLineCount(), position.lineNumber));
-		if (mode === 'center') {
-			// Cursor moves should actively bring the matching preview line near the
-			// middle of the viewport so click-to-line navigation feels direct.
-			return {
-				line,
-				ratio: 0.5,
-				kind: 'cursor',
-				edge: null,
-			};
-		}
-
-		const layout = editor.getLayoutInfo();
-		if (layout.height <= 0) return null;
-
-		const visiblePosition = editor.getScrolledVisiblePosition(position);
-		if (visiblePosition) {
-			const ratio = visiblePosition.top / layout.height;
-			return {
-				line,
-				ratio,
-				kind: 'viewport',
-				edge: getScrollSyncEdge(),
-			};
-		}
-
-		const lineTop = editor.getTopForLineNumber(line);
-		const scrollTop = editor.getScrollTop();
-		const ratio = (lineTop - scrollTop) / layout.height;
-
-		return {
-			line,
-			ratio,
-			kind: 'viewport',
-			edge: getScrollSyncEdge(),
-		};
-	}
-
 	function getScrollSyncEdge(): 'top' | 'bottom' | null {
 		if (!editor) return null;
 
@@ -868,30 +864,13 @@
 				onscrollsync?.(scrollState);
 			};
 
-			const emitCursorSync = (position: monaco.Position | null, mode: 'center' | 'viewport' = 'center') => {
-				if (isApplyingExternalScroll) return;
-
-				const scrollState = getCursorScrollSyncState(position, mode);
-				if (!scrollState) return;
-
-				onscrollsync?.(scrollState);
-			};
-
-			const d1 = editor.onDidChangeCursorPosition((e) => {
-				emitCursorSync(e.position, 'center');
-			});
-			const d2 = editor.onDidScrollChange((e) => {
+			const d1 = editor.onDidScrollChange((e) => {
 				if (e.scrollTopChanged) {
-					if (editor.hasTextFocus()) {
-						emitCursorSync(editor.getPosition(), 'viewport');
-					} else {
-						emitViewportSync();
-					}
+					emitViewportSync();
 				}
 			});
 			return () => {
 				d1.dispose();
-				d2.dispose();
 			};
 		}
 	});

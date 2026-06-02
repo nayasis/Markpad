@@ -55,11 +55,12 @@
 	let isFocused = $state(true);
 	let markdownBody = $state<HTMLElement | null>(null);
 	let editorPane = $state<Pick<EditorHandle, 'syncScrollToLine' | 'getScrollSyncState'> | null>(null);
-	let liveMode = $state(false);
+	let liveMode = $state(true);
 
 	let isDragging = $state(false);
 	let isProgrammaticScroll = false;
 	let lastScrollSyncSource = $state<'editor' | 'viewer'>('editor');
+	let suppressScrollSyncRefresh = $state(false);
 	let pendingScrollSyncFrame = 0;
 	let previewImageResizeObserver: ResizeObserver | null = null;
 	let viewMode = $state<ViewMode>((typeof localStorage !== 'undefined' ? (localStorage.getItem('editor.viewMode') as ViewMode | null) : null) ?? 'viewer');
@@ -95,6 +96,15 @@
 
 	$effect(() => {
 		localStorage.setItem('editor.viewMode', viewMode);
+	});
+
+	$effect(() => {
+		if (!liveMode || !currentFile) {
+			invoke('unwatch_file').catch(console.error);
+			return;
+		}
+
+		invoke('watch_file', { path: currentFile }).catch(console.error);
 	});
 
 	$effect(() => {
@@ -386,8 +396,6 @@
 				tabManager.setTabRawContent(activeId, content);
 			}
 
-			if (liveMode) invoke('watch_file', { path: filePath }).catch(console.error);
-
 			await tick();
 			if (options.linkedFromTabId && options.linkedFromTabId !== activeId) {
 				tabManager.recordLinkedTabNavigation(options.linkedFromTabId, activeId);
@@ -587,6 +595,10 @@
 		pendingScrollSyncFrame = requestAnimationFrame(() => {
 			pendingScrollSyncFrame = 0;
 
+			if (suppressScrollSyncRefresh) {
+				return;
+			}
+
 			if (source === 'viewer' && markdownBody) {
 				syncEditorToPreviewScroll(markdownBody);
 				return;
@@ -646,6 +658,7 @@
 	$effect(() => {
 		if (!isSplit || !isScrollSynced || !markdownBody || !editorPane) return;
 
+		suppressScrollSyncRefresh = false;
 		lastScrollSyncSource = 'editor';
 		scheduleScrollSyncRefresh('editor');
 	});
@@ -741,12 +754,10 @@
 
 			const top = el.offsetTop;
 			const bottom = top + el.offsetHeight;
-			const totalLines = endLine - startLine;
-			const relativeOffset = Math.max(0, Math.min(anchorOffset - top, el.offsetHeight));
-			const elementRatio = el.offsetHeight > 0 ? relativeOffset / el.offsetHeight : 0;
-			const estimatedLine = Math.max(startLine, Math.min(endLine, startLine + Math.round(totalLines * elementRatio)));
 			const state: ScrollSyncState = {
-				line: estimatedLine,
+				// Obsidian-style linked scrolling anchors to the first line of the
+				// markdown block instead of interpolating within the rendered block.
+				line: startLine,
 				ratio: viewportRatio,
 				kind: 'viewport',
 				edge: null,
@@ -789,7 +800,7 @@
 		if (!markdownBody) return;
 
 		const elements = getSourceMappedElements(markdownBody);
-		let fallback: { el: HTMLElement; startLine: number; endLine: number } | null = null;
+		let fallback: { el: HTMLElement; startLine: number } | null = null;
 
 		for (const el of elements) {
 			const sourcepos = el.dataset.sourcepos;
@@ -800,21 +811,11 @@
 
 				if (!isNaN(startLine) && !isNaN(endLine)) {
 					if (line >= startLine) {
-						fallback = { el, startLine, endLine };
+						fallback = { el, startLine };
 					}
 
 					if (line >= startLine && line <= endLine) {
-						const totalLines = endLine - startLine;
-						let lineRatio = 0;
-						if (totalLines > 0) {
-							lineRatio = (line - startLine) / totalLines;
-						}
-						lineRatio = Math.max(0, Math.min(1, lineRatio));
-
-						const elementTop = el.offsetTop + el.offsetHeight * lineRatio;
-
-						const viewportHeight = markdownBody.clientHeight;
-						const targetScroll = elementTop - viewportHeight * ratio;
+						const targetScroll = el.offsetTop - markdownBody.clientHeight * ratio;
 
 						if (Math.abs(markdownBody.scrollTop - targetScroll) > 5) {
 							isProgrammaticScroll = true;
@@ -827,12 +828,8 @@
 		}
 
 		if (fallback) {
-			const { el, startLine, endLine } = fallback;
-			const totalLines = Math.max(0, endLine - startLine);
-			const clampedLine = Math.max(startLine, Math.min(endLine, line));
-			const lineRatio = totalLines > 0 ? (clampedLine - startLine) / totalLines : 0;
-			const elementTop = el.offsetTop + el.offsetHeight * lineRatio;
-			const targetScroll = elementTop - markdownBody.clientHeight * ratio;
+			const { el } = fallback;
+			const targetScroll = el.offsetTop - markdownBody.clientHeight * ratio;
 
 			if (Math.abs(markdownBody.scrollTop - targetScroll) > 5) {
 				isProgrammaticScroll = true;
@@ -843,6 +840,7 @@
 
 	function handleEditorScrollSync(scrollState: ScrollSyncState) {
 		if (tabManager.activeTab?.isScrollSynced) {
+			suppressScrollSyncRefresh = false;
 			syncPreviewToEditor(scrollState);
 		}
 	}
@@ -886,6 +884,7 @@
 			return;
 		}
 
+		suppressScrollSyncRefresh = false;
 		syncPreviewState(target, true);
 	}
 
@@ -1397,11 +1396,8 @@
 
 	async function toggleLiveMode() {
 		liveMode = !liveMode;
-		if (liveMode && currentFile) {
-			await invoke('watch_file', { path: currentFile });
-			if (tabManager.activeTabId) await loadMarkdown(currentFile);
-		} else {
-			await invoke('unwatch_file');
+		if (liveMode && currentFile && tabManager.activeTabId && !tabManager.activeTab?.isDirty) {
+			await loadMarkdown(currentFile, { skipTabManagement: true, activate: false });
 		}
 	}
 
@@ -1619,6 +1615,9 @@
 		const tab = tabManager.activeTab;
 		if (tab && isSplit && tab.rawContent !== undefined) {
 			clearTimeout(debounceTimer);
+			if (tab.isDirty && isScrollSynced) {
+				suppressScrollSyncRefresh = true;
+			}
 			debounceTimer = setTimeout(() => {
 				invoke('render_markdown', { content: tab.rawContent })
 					.then((html) => {
@@ -1849,8 +1848,12 @@
 				}),
 			);
 			unlisteners.push(
-				await listen('file-changed', () => {
-					if (liveMode && currentFile) loadMarkdown(currentFile);
+				await listen('file-changed', (event) => {
+					const changedPath = event.payload as string;
+					const activeTab = tabManager.activeTab;
+					if (!liveMode || !changedPath || !activeTab?.path || activeTab.isDirty) return;
+					if (normalizeComparablePath(activeTab.path) !== normalizeComparablePath(changedPath)) return;
+					loadMarkdown(activeTab.path, { skipTabManagement: true, activate: false });
 				}),
 			);
 
