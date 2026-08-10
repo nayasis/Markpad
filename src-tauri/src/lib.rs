@@ -53,6 +53,12 @@ async fn show_window(window: tauri::Window) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImageSizeSpec<'a> {
+    width: Option<&'a str>,
+    height: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EmbedOptions<'a> {
     width: Option<&'a str>,
     height: Option<&'a str>,
@@ -67,7 +73,7 @@ fn escape_html_attr(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn parse_image_size_spec(value: &str) -> Option<(Option<&str>, Option<&str>)> {
+fn parse_image_size_spec(value: &str) -> Option<ImageSizeSpec<'_>> {
     fn parse_dimension(dimension: &str) -> Option<Option<&str>> {
         let dimension = dimension.trim();
         if dimension.is_empty() {
@@ -91,11 +97,14 @@ fn parse_image_size_spec(value: &str) -> Option<(Option<&str>, Option<&str>)> {
         if width.is_none() && height.is_none() {
             None
         } else {
-            Some((width, height))
+            Some(ImageSizeSpec { width, height })
         }
     } else {
         let width = parse_dimension(trimmed)?;
-        width.map(|width| (Some(width), None))
+        width.map(|width| ImageSizeSpec {
+            width: Some(width),
+            height: None,
+        })
     }
 }
 
@@ -114,13 +123,20 @@ fn parse_embed_options(value: &str) -> Option<EmbedOptions<'_>> {
         parts.pop();
     }
 
-    let (width, height) = if let Some(size_part) = parts.pop() {
-        parse_image_size_spec(size_part)?
-    } else if pdf_hidden {
-        (None, None)
-    } else {
+    let mut width = None;
+    let mut height = None;
+
+    if let Some(size_part) = parts.last().copied() {
+        if let Some(size) = parse_image_size_spec(size_part) {
+            width = size.width;
+            height = size.height;
+            parts.pop();
+        }
+    }
+
+    if !parts.is_empty() || (width.is_none() && height.is_none() && !pdf_hidden) {
         return None;
-    };
+    }
 
     Some(EmbedOptions {
         width,
@@ -145,17 +161,16 @@ fn parse_markdown_alt_options(alt: &str) -> Option<(String, EmbedOptions<'_>)> {
 
     let mut width = None;
     let mut height = None;
-    if parts.len() >= 2 {
-        if let Some((parsed_width, parsed_height)) = parse_image_size_spec(parts.last().unwrap()) {
-            width = parsed_width;
-            height = parsed_height;
+
+    if let Some(size_part) = parts.last().copied() {
+        if let Some(size) = parse_image_size_spec(size_part.trim()) {
+            width = size.width;
+            height = size.height;
             parts.pop();
         } else if !pdf_hidden {
             return None;
         }
-    }
-
-    if !pdf_hidden && width.is_none() && height.is_none() {
+    } else if !pdf_hidden {
         return None;
     }
 
@@ -431,7 +446,10 @@ fn render_markdown(content: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{convert_markdown, normalize_indented_fenced_code_blocks, read_file_change_stamp};
+    use super::{
+        attachment_root_name, convert_markdown, copy_file_to_attachment,
+        normalize_indented_fenced_code_blocks, read_file_change_stamp, save_bytes_to_attachment,
+    };
     use std::{
         env, fs, thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -486,6 +504,28 @@ mod tests {
     }
 
     #[test]
+    fn renders_markdown_pdf_with_hidden_flag() {
+        let html = convert_markdown("![sample|600x800|hidden](sample.pdf)");
+
+        assert!(html.contains(r#"src="sample.pdf""#));
+        assert!(html.contains(r#"alt="sample""#));
+        assert!(html.contains(r#"width="600""#));
+        assert!(html.contains(r#"height="800""#));
+        assert!(html.contains(r#"data-pdf-hidden="true""#));
+    }
+
+    #[test]
+    fn renders_obsidian_pdf_embed_with_hidden_flag() {
+        let html = convert_markdown("![[sample.pdf|600x800|hidden]]");
+
+        assert!(html.contains(r#"src="sample.pdf""#));
+        assert!(html.contains(r#"alt="sample.pdf""#));
+        assert!(html.contains(r#"width="600""#));
+        assert!(html.contains(r#"height="800""#));
+        assert!(html.contains(r#"data-pdf-hidden="true""#));
+    }
+
+    #[test]
     fn normalizes_indented_fenced_code_blocks() {
         let normalized = normalize_indented_fenced_code_blocks(
             "    ```powershell\n    # Install Node.js\n    winget install OpenJS.NodeJS\n    ```\n",
@@ -533,6 +573,65 @@ mod tests {
         assert!(!stamp.exists);
     }
 
+    #[test]
+    fn copy_file_to_attachment_stores_images_in_attachment_root() {
+        let dir = unique_test_dir("attachment-copy-image");
+        fs::create_dir_all(&dir).unwrap();
+
+        let document_path = dir.join("note.md");
+        fs::write(&document_path, "# note").unwrap();
+
+        let source_path = dir.join("source.png");
+        fs::write(&source_path, [1_u8, 2, 3]).unwrap();
+
+        let relative_path = copy_file_to_attachment(
+            source_path.to_string_lossy().into_owned(),
+            document_path.to_string_lossy().into_owned(),
+            "pasted.png".to_string(),
+            true,
+        )
+        .unwrap();
+
+        let attachment_root = dir.join(attachment_root_name(&document_path));
+
+        assert_eq!(
+            relative_path,
+            format!("{}/pasted.png", attachment_root_name(&document_path))
+        );
+        assert!(attachment_root.join("pasted.png").exists());
+        assert!(!attachment_root.join("images").exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_bytes_to_attachment_stores_images_in_attachment_root() {
+        let dir = unique_test_dir("attachment-save-image");
+        fs::create_dir_all(&dir).unwrap();
+
+        let document_path = dir.join("note.md");
+        fs::write(&document_path, "# note").unwrap();
+
+        let relative_path = save_bytes_to_attachment(
+            document_path.to_string_lossy().into_owned(),
+            vec![4_u8, 5, 6],
+            "clipboard.png".to_string(),
+            true,
+        )
+        .unwrap();
+
+        let attachment_root = dir.join(attachment_root_name(&document_path));
+
+        assert_eq!(
+            relative_path,
+            format!("{}/clipboard.png", attachment_root_name(&document_path))
+        );
+        assert!(attachment_root.join("clipboard.png").exists());
+        assert!(!attachment_root.join("images").exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     fn unique_test_path(label: &str) -> std::path::PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -541,27 +640,12 @@ mod tests {
         env::temp_dir().join(format!("markpad-{label}-{suffix}.md"))
     }
 
-    #[test]
-    fn renders_markdown_pdf_with_size_and_hidden_flag() {
-        let html = convert_markdown("![sample|600x800|hidden](sample.pdf)");
-
-        assert!(html.contains(r#"src="sample.pdf""#));
-        assert!(html.contains(r#"alt="sample""#));
-        assert!(html.contains(r#"width="600""#));
-        assert!(html.contains(r#"height="800""#));
-        assert!(html.contains(r#"data-pdf-hidden="true""#));
-        assert!(!html.contains(r#"alt="sample|600x800|hidden""#));
-    }
-
-    #[test]
-    fn renders_obsidian_pdf_embed_with_size_and_hidden_flag() {
-        let html = convert_markdown("![[sample.pdf|600x800|hidden]]");
-
-        assert!(html.contains(r#"src="sample.pdf""#));
-        assert!(html.contains(r#"alt="sample.pdf""#));
-        assert!(html.contains(r#"width="600""#));
-        assert!(html.contains(r#"height="800""#));
-        assert!(html.contains(r#"data-pdf-hidden="true""#));
+    fn unique_test_dir(label: &str) -> std::path::PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("markpad-{label}-{suffix}"))
     }
 }
 
@@ -732,6 +816,8 @@ fn copy_file_to_attachment(
     target_filename: String,
     is_image: bool,
 ) -> Result<String, String> {
+    let _ = is_image;
+
     // Validate document path
     let doc_path = Path::new(&document_path);
     if !doc_path.exists() {
@@ -740,16 +826,8 @@ fn copy_file_to_attachment(
 
     let attach_root_name = attachment_root_name(doc_path);
     let attach_root = attachment_root_dir(doc_path)?;
-    let attach_dir = if is_image {
-        attach_root.join("images")
-    } else {
-        attach_root.clone()
-    };
-    let subdir = if is_image {
-        format!("{}/images", attach_root_name)
-    } else {
-        attach_root_name.clone()
-    };
+    let attach_dir = attach_root.clone();
+    let subdir = attach_root_name.clone();
 
     let is_new_folder = !attach_root.exists();
 
@@ -805,6 +883,8 @@ fn save_bytes_to_attachment(
     filename: String,
     is_image: bool,
 ) -> Result<String, String> {
+    let _ = is_image;
+
     let doc_path = Path::new(&document_path);
     if !doc_path.exists() {
         return Err("Document must be saved first".to_string());
@@ -812,16 +892,8 @@ fn save_bytes_to_attachment(
 
     let attach_root_name = attachment_root_name(doc_path);
     let attach_root = attachment_root_dir(doc_path)?;
-    let attach_dir = if is_image {
-        attach_root.join("images")
-    } else {
-        attach_root.clone()
-    };
-    let subdir = if is_image {
-        format!("{}/images", attach_root_name)
-    } else {
-        attach_root_name.clone()
-    };
+    let attach_dir = attach_root.clone();
+    let subdir = attach_root_name.clone();
 
     let is_new_folder = !attach_root.exists();
 

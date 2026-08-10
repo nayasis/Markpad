@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 	import { listen } from '@tauri-apps/api/event';
-	import { getCurrentWindow } from '@tauri-apps/api/window';
+	import { currentMonitor, getCurrentWindow, PhysicalPosition, PhysicalSize } from '@tauri-apps/api/window';
 	import { onMount, tick, untrack } from 'svelte';
 	import { fly } from 'svelte/transition';
 	import { openUrl } from '@tauri-apps/plugin-opener';
@@ -49,6 +49,14 @@
 
 	type ViewMode = 'viewer' | 'edit' | 'split';
 
+	type PdfWindowFullscreenState = {
+		alwaysOnTop: boolean;
+		decorated: boolean;
+		maximized: boolean;
+		position: { x: number; y: number };
+		size: { width: number; height: number };
+	};
+
 	let showSettings = $state(false);
 
 	let recentFiles = $state<string[]>([]);
@@ -63,6 +71,8 @@
 	let suppressScrollSyncRefresh = $state(false);
 	let pendingScrollSyncFrame = 0;
 	let previewImageResizeObserver: ResizeObserver | null = null;
+	let activePdfFullscreenContainer: HTMLElement | null = null;
+	let activePdfWindowFullscreenState: PdfWindowFullscreenState | null = null;
 	let viewMode = $state<ViewMode>((typeof localStorage !== 'undefined' ? (localStorage.getItem('editor.viewMode') as ViewMode | null) : null) ?? 'viewer');
 
 	// derived from tab manager
@@ -269,7 +279,7 @@
 
 			if (src) {
 				const isPdf = isPdfPath(src);
-				const ext = src.split('#')[0].split('?')[0].split('.').pop()?.toLowerCase();
+				const ext = src.split('.').pop()?.toLowerCase();
 				const isVideo = ['mp4', 'webm', 'ogg', 'mov'].includes(ext || '');
 				const isAudio = ['mp3', 'wav', 'aac', 'flac', 'm4a'].includes(ext || '');
 
@@ -365,6 +375,52 @@
 		}
 
 		return doc.body.innerHTML;
+	}
+
+	function getReusableImageKey(image: Element): string {
+		return [
+			image.getAttribute('data-local-path') ?? '',
+			image.getAttribute('src') ?? '',
+			image.getAttribute('alt') ?? '',
+			image.getAttribute('title') ?? '',
+			image.getAttribute('width') ?? '',
+			image.getAttribute('height') ?? '',
+		].join('|');
+	}
+
+	function reuseStablePreviewImages(nextRoot: ParentNode, currentRoot: ParentNode) {
+		const reusableImages = new Map<string, HTMLImageElement[]>();
+
+		for (const image of Array.from(currentRoot.querySelectorAll('img'))) {
+			const key = getReusableImageKey(image);
+			const existing = reusableImages.get(key);
+			if (existing) {
+				existing.push(image);
+			} else {
+				reusableImages.set(key, [image]);
+			}
+		}
+
+		for (const image of Array.from(nextRoot.querySelectorAll('img'))) {
+			const key = getReusableImageKey(image);
+			const matches = reusableImages.get(key);
+			const reusable = matches?.shift();
+			if (reusable) {
+				image.replaceWith(reusable);
+			}
+		}
+	}
+
+	function updatePreviewMarkup(body: HTMLElement, html: string) {
+		if (!isSplit) {
+			body.innerHTML = html;
+			return;
+		}
+
+		const template = document.createElement('template');
+		template.innerHTML = html;
+		reuseStablePreviewImages(template.content, body);
+		body.replaceChildren(template.content);
 	}
 
 	async function loadMarkdown(filePath: string, options: { navigate?: boolean; skipTabManagement?: boolean; activate?: boolean; fragment?: string | null; linkedFromTabId?: string | null } = {}) {
@@ -592,8 +648,9 @@
 			(anchor as any)._localClickHandler = handler;
 		});
 
-		refreshPreviewImageObservers();
 		attachPdfEmbedHandlers();
+
+		refreshPreviewImageObservers();
 		scheduleScrollSyncRefresh();
 	}
 
@@ -632,7 +689,9 @@
 
 		if (!markdownBody || typeof ResizeObserver === 'undefined') return;
 
-		const resizeTargets = Array.from(markdownBody.querySelectorAll('img, .markdown-pdf-embed'));
+		const images = Array.from(markdownBody.querySelectorAll('img'));
+		const pdfEmbeds = Array.from(markdownBody.querySelectorAll('.markdown-pdf-embed'));
+		const resizeTargets = [...images, ...pdfEmbeds];
 		if (!resizeTargets.length) return;
 
 		previewImageResizeObserver = new ResizeObserver(() => {
@@ -641,14 +700,44 @@
 
 		for (const target of resizeTargets) {
 			previewImageResizeObserver.observe(target);
+		}
 
-			if (target instanceof HTMLImageElement && !target.complete) {
-				const image = target;
+		for (const image of images) {
+			if (!image.complete) {
 				image.addEventListener('load', () => scheduleScrollSyncRefresh(), { once: true });
 				image.addEventListener('error', () => scheduleScrollSyncRefresh(), { once: true });
 			}
 		}
 	}
+
+	$effect(() => {
+		const body = markdownBody;
+		if (!body) return;
+
+		updatePreviewMarkup(body, htmlContent);
+	});
+
+	$effect(() => {
+		const handleFullscreenChange = () => {
+			const fullscreenElement = document.fullscreenElement as HTMLElement | null;
+			if (fullscreenElement?.classList.contains('markdown-pdf-embed')) {
+				activePdfFullscreenContainer = fullscreenElement;
+				attachPdfEmbedHandlers();
+				return;
+			}
+
+			if (!activePdfFullscreenContainer) return;
+
+			activePdfFullscreenContainer = null;
+			void restorePdfWindowFullscreenState();
+			attachPdfEmbedHandlers();
+		};
+
+		document.addEventListener('fullscreenchange', handleFullscreenChange);
+		return () => {
+			document.removeEventListener('fullscreenchange', handleFullscreenChange);
+		};
+	});
 
 	$effect(() => {
 		if (htmlContent && markdownBody && !isEditing && hljs && renderMathInElement && mermaid) renderRichContent();
@@ -944,6 +1033,28 @@
 		}
 	}
 
+	async function reloadTabFromDisk(tab = tabManager.activeTab) {
+		if (!tab || !tab.path || tab.path === 'HOME' || tab.isDirty) return;
+
+		if (tabSupportsPreview(tab) && !isEditing && !isSplit) {
+			await loadMarkdown(tab.path, { skipTabManagement: true, activate: false });
+			return;
+		}
+
+		try {
+			const content = (await invoke('read_file_content', { path: tab.path })) as string;
+			if (tabManager.activeTabId !== tab.id) return;
+
+			tabManager.setTabRawContent(tab.id, content);
+
+			if (tabSupportsPreview(tab)) {
+				await renderPreviewFromRaw(tab);
+			}
+		} catch (error) {
+			console.error('Failed to reload file from disk', error);
+		}
+	}
+
 	async function setViewMode(nextMode: ViewMode, autoSave = false) {
 		const tab = tabManager.activeTab;
 		if (!tab) return;
@@ -988,7 +1099,6 @@
 
 		if (nextMode === 'split') {
 			tabManager.setSplitEnabled(tab.id, true);
-			if (liveMode) toggleLiveMode();
 		}
 	}
 
@@ -1118,10 +1228,6 @@
 		return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext || '');
 	}
 
-	function isPdfFile(filename: string): boolean {
-		return filename.split('.').pop()?.toLowerCase() === 'pdf';
-	}
-
 	function sanitizeFilename(filename: string): string {
 		const basename = filename.split(/[/\\]/).pop() || 'file';
 
@@ -1156,13 +1262,12 @@
 			return;
 		}
 
-		let insertedCount = 0;
+		const insertedTexts: string[] = [];
 
 		for (const sourcePath of paths) {
 			try {
 				const originalFilename = sourcePath.split(/[/\\]/).pop() || 'file';
 				const isImage = isImageFile(originalFilename);
-				const isPdf = isPdfFile(originalFilename);
 				const targetFilename = sanitizeFilename(originalFilename);
 
 				const relativePath = await invoke<string>('copy_file_to_attachment', {
@@ -1176,14 +1281,11 @@
 				// Use original filename for alt text (remove extension)
 				const nameWithoutExt = originalFilename.replace(/\.[^/.]+$/, '');
 
-				const text = isImage || isPdf
+				const text = isImage
 					? `![${nameWithoutExt}](${markdownPath})`
 					: `[${originalFilename}](${markdownPath})`;
 
-				// Insert text into Editor component
-				editorComponent?.insertText(text);
-				insertedCount++;
-
+				insertedTexts.push(text);
 			} catch (error) {
 				console.error('Failed to copy file:', error);
 				await askCustom(
@@ -1193,8 +1295,12 @@
 			}
 		}
 
+		if (insertedTexts.length > 0) {
+			editorComponent?.insertText(insertedTexts.join('\n'));
+		}
+
 		// Focus window and editor after all files are processed
-		if (insertedCount > 0) {
+		if (insertedTexts.length > 0) {
 			await tick(); // Wait for DOM updates
 
 			// Focus Tauri window at OS level - try multiple times with delay
@@ -1260,10 +1366,266 @@
 	function appendPdfToolbarActions(actions: HTMLElement, toggleLabel: string) {
 		for (const [action, label] of [
 			['toggle', toggleLabel],
+			['fullscreen', 'Fullscreen'],
 			['open', 'Open'],
 			['copy-path', 'Copy Path'],
 		]) {
 			appendPdfActionButton(actions, action, label);
+		}
+	}
+
+	function parsePdfSizeSpec(value: string): { width: string | null; height: string | null } | null {
+		const trimmed = value.trim();
+		if (!trimmed) return null;
+
+		if (trimmed.includes('x')) {
+			const [widthRaw, heightRaw] = trimmed.split('x', 2);
+			const width = widthRaw.trim();
+			const height = heightRaw.trim();
+			if ((width && !/^\d+$/.test(width)) || (height && !/^\d+$/.test(height))) {
+				return null;
+			}
+			if (!width && !height) return null;
+			return {
+				width: width || null,
+				height: height || null,
+			};
+		}
+
+		return /^\d+$/.test(trimmed)
+			? {
+					width: trimmed,
+					height: null,
+				}
+			: null;
+	}
+
+	function formatPdfSizeSpec(width: string | null, height: string | null): string | null {
+		if (width && height) return `${width}x${height}`;
+		if (width) return width;
+		if (height) return `x${height}`;
+		return null;
+	}
+
+	function parseMarkdownPdfAlt(alt: string): { actualAlt: string; width: string | null; height: string | null } {
+		const parts = alt.split('|');
+		if (parts.length === 0) {
+			return { actualAlt: alt, width: null, height: null };
+		}
+
+		let working = [...parts];
+		if (working.at(-1)?.trim().toLowerCase() === 'hidden') {
+			working = working.slice(0, -1);
+		}
+
+		let width: string | null = null;
+		let height: string | null = null;
+		if (working.length > 1) {
+			const size = parsePdfSizeSpec(working.at(-1) ?? '');
+			if (size) {
+				width = size.width;
+				height = size.height;
+				working = working.slice(0, -1);
+			}
+		}
+
+		return {
+			actualAlt: working.join('|'),
+			width,
+			height,
+		};
+	}
+
+	function getPdfTargetVariants(markdownTarget: string): Set<string> {
+		const variants = new Set<string>();
+		const raw = markdownTarget.trim();
+		if (!raw) return variants;
+
+		variants.add(raw);
+		const withoutSuffix = raw.split('#')[0].split('?')[0];
+		variants.add(withoutSuffix);
+
+		const decoded = decodeMarkdownPath(withoutSuffix);
+		variants.add(decoded);
+		variants.add(encodeMarkdownPath(decoded));
+
+		return variants;
+	}
+
+	function matchesPdfTarget(target: string, variants: Set<string>): boolean {
+		const trimmed = target.trim();
+		if (variants.has(trimmed)) return true;
+
+		const normalized = trimmed.split('#')[0].split('?')[0];
+		if (variants.has(normalized)) return true;
+
+		return variants.has(decodeMarkdownPath(normalized));
+	}
+
+	function buildPdfImageMarkdown(target: string, alt: string, width: string | null, height: string | null, hidden: boolean): string {
+		let formattedAlt = alt;
+		const size = formatPdfSizeSpec(width, height);
+		if (size) {
+			formattedAlt += `|${size}`;
+		}
+		if (hidden) {
+			formattedAlt += '|hidden';
+		}
+		return `![${formattedAlt}](${target})`;
+	}
+
+	function buildPdfObsidianMarkdown(target: string, width: string | null, height: string | null, hidden: boolean): string {
+		let suffix = '';
+		const size = formatPdfSizeSpec(width, height);
+		if (size) {
+			suffix += `|${size}`;
+		}
+		if (hidden) {
+			suffix += '|hidden';
+		}
+		return `![[${target}${suffix}]]`;
+	}
+
+	function rewritePdfVisibilityInContent(
+		content: string,
+		markdownTarget: string,
+		hidden: boolean,
+		fallbackTitle: string,
+		width: string | null,
+		height: string | null,
+	): string {
+		const targetVariants = getPdfTargetVariants(markdownTarget);
+		let updated = false;
+
+		const obsidianUpdated = content.replace(/!\[\[([^\]]+)\]\]/g, (match, inner: string) => {
+			if (updated) return match;
+
+			const parts = inner.split('|');
+			const target = parts.shift()?.trim();
+			if (!target || !matchesPdfTarget(target, targetVariants)) return match;
+
+			let working = [...parts];
+			if (working.at(-1)?.trim().toLowerCase() === 'hidden') {
+				working = working.slice(0, -1);
+			}
+
+			let nextWidth = width;
+			let nextHeight = height;
+			if (working.length > 0) {
+				const size = parsePdfSizeSpec(working.at(-1) ?? '');
+				if (size) {
+					nextWidth = size.width;
+					nextHeight = size.height;
+				}
+			}
+
+			updated = true;
+			return buildPdfObsidianMarkdown(target, nextWidth, nextHeight, hidden);
+		});
+
+		if (updated) return obsidianUpdated;
+
+		const imageUpdated = content.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (match, alt: string, target: string) => {
+			if (updated || !matchesPdfTarget(target, targetVariants)) return match;
+
+			const parsed = parseMarkdownPdfAlt(alt);
+			updated = true;
+			return buildPdfImageMarkdown(
+				target,
+				parsed.actualAlt || fallbackTitle,
+				parsed.width ?? width,
+				parsed.height ?? height,
+				hidden,
+			);
+		});
+
+		if (updated) return imageUpdated;
+
+		return content.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (match, label: string, target: string, offset: number) => {
+			if (updated || (offset > 0 && content[offset - 1] === '!') || !matchesPdfTarget(target, targetVariants)) return match;
+
+			updated = true;
+			return buildPdfImageMarkdown(target, label.trim() || fallbackTitle, width, height, hidden);
+		});
+	}
+
+	async function persistPdfVisibility(container: HTMLElement, hidden: boolean) {
+		const tab = tabManager.activeTab;
+		if (!tab?.path) return;
+
+		const markdownTarget = container.dataset.markdownTarget ?? container.dataset.localPath ?? container.dataset.pdfSrc;
+		if (!markdownTarget) return;
+
+		const title = (container.querySelector('.markdown-pdf-title') as HTMLElement | null)?.textContent?.trim() || 'PDF';
+		const width = container.style.width ? container.style.width.replace(/px$/, '') : null;
+		const rawHeight = container.style.getPropertyValue('--pdf-height').trim();
+		const height = rawHeight ? rawHeight.replace(/px$/, '') : null;
+		const baseContent = isSplit ? tab.rawContent : await invoke<string>('read_file_content', { path: tab.path });
+		const nextContent = rewritePdfVisibilityInContent(baseContent, markdownTarget, hidden, title, width, height);
+
+		if (nextContent === baseContent) return;
+
+		if (isSplit) {
+			tabManager.updateTabRawContent(tab.id, nextContent);
+			return;
+		}
+
+		await invoke('save_file_content', { path: tab.path, content: nextContent });
+		tabManager.setTabRawContent(tab.id, nextContent);
+
+		const html = (await invoke('render_markdown', { content: nextContent })) as string;
+		const processedInfo = processMarkdownHtml(html, tab.path);
+		tabManager.updateTabContent(tab.id, processedInfo);
+	}
+
+	async function enterPdfWindowFullscreenState(container: HTMLElement) {
+		const monitor = await currentMonitor();
+		if (!monitor) {
+			throw new Error('Unable to determine the current monitor.');
+		}
+
+		if (!activePdfWindowFullscreenState) {
+			const [decorated, alwaysOnTop, maximized, position, size] = await Promise.all([
+				appWindow.isDecorated(),
+				appWindow.isAlwaysOnTop(),
+				appWindow.isMaximized(),
+				appWindow.outerPosition(),
+				appWindow.innerSize(),
+			]);
+
+			activePdfWindowFullscreenState = {
+				alwaysOnTop,
+				decorated,
+				maximized,
+				position: { x: position.x, y: position.y },
+				size: { width: size.width, height: size.height },
+			};
+		}
+
+		if (await appWindow.isMaximized()) {
+			await appWindow.unmaximize();
+		}
+
+		await appWindow.setDecorations(false);
+		await appWindow.setAlwaysOnTop(true);
+		await appWindow.setPosition(new PhysicalPosition(monitor.position.x, monitor.position.y));
+		await appWindow.setSize(new PhysicalSize(monitor.size.width, monitor.size.height));
+		await container.requestFullscreen();
+		activePdfFullscreenContainer = container;
+	}
+
+	async function restorePdfWindowFullscreenState() {
+		const state = activePdfWindowFullscreenState;
+		activePdfWindowFullscreenState = null;
+		if (!state) return;
+
+		await appWindow.setAlwaysOnTop(state.alwaysOnTop);
+		await appWindow.setDecorations(state.decorated);
+		await appWindow.setPosition(new PhysicalPosition(state.position.x, state.position.y));
+		await appWindow.setSize(new PhysicalSize(state.size.width, state.size.height));
+
+		if (state.maximized) {
+			await appWindow.maximize();
 		}
 	}
 
@@ -1272,6 +1634,7 @@
 		const container = doc.createElement('div');
 		container.className = 'markdown-pdf-embed';
 		container.dataset.pdfSrc = pdfSrc;
+		container.dataset.markdownTarget = originalSrc;
 
 		const localPath = image.dataset.localPath;
 		if (localPath) container.dataset.localPath = localPath;
@@ -1297,8 +1660,7 @@
 
 		const actions = doc.createElement('div');
 		actions.className = 'markdown-pdf-actions';
-
-		appendPdfToolbarActions(actions, container.classList.contains('markdown-pdf-collapsed') ? 'Show PDF' : 'Hide PDF');
+		appendPdfToolbarActions(actions, 'Hide PDF');
 
 		toolbar.appendChild(actions);
 		container.appendChild(toolbar);
@@ -1308,6 +1670,7 @@
 		frame.src = pdfSrc;
 		frame.title = title;
 		frame.loading = 'lazy';
+		frame.allowFullscreen = true;
 		container.appendChild(frame);
 
 		image.replaceWith(container);
@@ -1318,6 +1681,7 @@
 		const container = doc.createElement('div');
 		container.className = 'markdown-pdf-embed';
 		container.dataset.pdfSrc = pdfSrc;
+		container.dataset.markdownTarget = originalSrc;
 
 		const localPath = anchor.dataset.localPath;
 		if (localPath) container.dataset.localPath = localPath;
@@ -1337,7 +1701,6 @@
 
 		const actions = doc.createElement('div');
 		actions.className = 'markdown-pdf-actions';
-
 		appendPdfToolbarActions(actions, 'Hide PDF');
 
 		toolbar.appendChild(actions);
@@ -1348,6 +1711,7 @@
 		frame.src = pdfSrc;
 		frame.title = title;
 		frame.loading = 'lazy';
+		frame.allowFullscreen = true;
 		container.appendChild(frame);
 
 		replaceTarget.replaceWith(container);
@@ -1360,6 +1724,7 @@
 			const container = embed as HTMLElement;
 			const frame = container.querySelector('iframe.markdown-pdf-frame') as HTMLIFrameElement | null;
 			const toggleButton = container.querySelector('[data-pdf-action="toggle"]') as HTMLButtonElement | null;
+			const fullscreenButton = container.querySelector('[data-pdf-action="fullscreen"]') as HTMLButtonElement | null;
 			const openButton = container.querySelector('[data-pdf-action="open"]') as HTMLButtonElement | null;
 			const copyPathButton = container.querySelector('[data-pdf-action="copy-path"]') as HTMLButtonElement | null;
 
@@ -1370,18 +1735,68 @@
 				toggleButton.setAttribute('aria-expanded', String(!collapsed));
 			};
 
+			const syncPdfActionVisibility = () => {
+				const collapsed = container.classList.contains('markdown-pdf-collapsed');
+				const fullscreen = document.fullscreenElement === container;
+
+				if (toggleButton) {
+					toggleButton.hidden = fullscreen;
+				}
+
+				if (fullscreenButton) {
+					fullscreenButton.hidden = collapsed;
+				}
+			};
+
 			if (toggleButton) {
 				const oldHandler = (toggleButton as any)._pdfClickHandler;
 				if (oldHandler) toggleButton.removeEventListener('click', oldHandler);
 
-				const handler = () => {
+				const handler = async () => {
+					const nextHidden = !container.classList.contains('markdown-pdf-collapsed');
 					container.classList.toggle('markdown-pdf-collapsed');
 					syncToggleLabel();
+					syncPdfActionVisibility();
 					scheduleScrollSyncRefresh();
+
+					try {
+						await persistPdfVisibility(container, nextHidden);
+					} catch (error) {
+						container.classList.toggle('markdown-pdf-collapsed');
+						syncToggleLabel();
+						syncPdfActionVisibility();
+						scheduleScrollSyncRefresh();
+						console.error('Failed to persist PDF visibility:', error);
+						await askCustom(`Failed to save PDF visibility: ${error}`, { title: 'Error', kind: 'error' });
+					}
 				};
 				toggleButton.addEventListener('click', handler);
 				(toggleButton as any)._pdfClickHandler = handler;
 				syncToggleLabel();
+			}
+
+			if (fullscreenButton) {
+				const oldHandler = (fullscreenButton as any)._pdfClickHandler;
+				if (oldHandler) fullscreenButton.removeEventListener('click', oldHandler);
+
+				const handler = async () => {
+					try {
+						if (document.fullscreenElement === container) {
+							await document.exitFullscreen();
+						} else {
+							await enterPdfWindowFullscreenState(container);
+						}
+						syncPdfActionVisibility();
+					} catch (error) {
+						if (!document.fullscreenElement) {
+							await restorePdfWindowFullscreenState().catch(console.error);
+						}
+						console.error('Failed to open PDF in fullscreen:', error);
+						await askCustom(`Failed to open PDF in fullscreen: ${error}`, { title: 'Error', kind: 'error' });
+					}
+				};
+				fullscreenButton.addEventListener('click', handler);
+				(fullscreenButton as any)._pdfClickHandler = handler;
 			}
 
 			if (openButton) {
@@ -1425,6 +1840,8 @@
 				frame.addEventListener('load', handler);
 				(frame as any)._pdfLoadHandler = handler;
 			}
+
+			syncPdfActionVisibility();
 		}
 	}
 
@@ -1598,7 +2015,7 @@
 	async function toggleLiveMode() {
 		liveMode = !liveMode;
 		if (liveMode && currentFile && tabManager.activeTabId && !tabManager.activeTab?.isDirty) {
-			await loadMarkdown(currentFile, { skipTabManagement: true, activate: false });
+			await reloadTabFromDisk();
 		}
 	}
 
@@ -1825,7 +2242,7 @@
 		}
 	}
 
-	let debounceTimer: ReturnType<typeof setTimeout>;
+	let debounceTimer: number;
 
 	$effect(() => {
 		const tab = tabManager.activeTab;
@@ -2069,7 +2486,7 @@
 					const activeTab = tabManager.activeTab;
 					if (!liveMode || !changedPath || !activeTab?.path || activeTab.isDirty) return;
 					if (normalizeComparablePath(activeTab.path) !== normalizeComparablePath(changedPath)) return;
-					loadMarkdown(activeTab.path, { skipTabManagement: true, activate: false });
+					void reloadTabFromDisk(activeTab);
 				}),
 			);
 
@@ -2260,6 +2677,7 @@
 		}}
 		ontoggleHome={toggleHome}
 		ononpenFileLocation={openFileLocation}
+		oncopyFilePath={() => currentFile && void copyPathToClipboard(currentFile)}
 		ontoggleLiveMode={toggleLiveMode}
 		ontoggleEdit={() => toggleEdit()}
 		ontoggleSplit={() => tabManager.activeTabId && toggleSplitView(tabManager.activeTabId)}
@@ -2308,6 +2726,7 @@
 		}}
 		ontoggleHome={toggleHome}
 		ononpenFileLocation={openFileLocation}
+		oncopyFilePath={() => currentFile && void copyPathToClipboard(currentFile)}
 		ontoggleLiveMode={toggleLiveMode}
 		ontoggleEdit={() => toggleEdit()}
 		ontoggleSplit={() => tabManager.activeTabId && toggleSplitView(tabManager.activeTabId)}
@@ -2376,7 +2795,6 @@
 							bind:this={markdownBody}
 							contenteditable="false"
 							class="markdown-body {isFullWidth ? 'full-width' : ''}"
-							bind:innerHTML={htmlContent}
 							onscroll={handleScroll}
 							tabindex="-1"
 							style="outline: none; font-family: {settings.previewFont}, sans-serif; font-size: {settings.previewFontSize}px;">
@@ -2513,6 +2931,86 @@
 		width: 100%;
 		height: 100%;
 		border-radius: 8px;
+	}
+
+	:global(.markdown-pdf-embed) {
+		width: 100%;
+		max-width: 100%;
+		margin: 1em 0;
+		border: 1px solid var(--color-border-default);
+		border-radius: 8px;
+		overflow: hidden;
+		background: var(--color-canvas-subtle);
+		box-sizing: border-box;
+	}
+
+	:global(.markdown-pdf-toolbar) {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		padding: 8px 10px;
+		border-bottom: 1px solid var(--color-border-default);
+		background: var(--color-canvas-default);
+	}
+
+	:global(.markdown-pdf-title) {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		color: var(--color-fg-default);
+		font-size: 13px;
+		font-weight: 600;
+	}
+
+	:global(.markdown-pdf-actions) {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		flex-shrink: 0;
+	}
+
+	:global(.markdown-pdf-actions button) {
+		height: 26px;
+		padding: 0 8px;
+		border: 1px solid var(--color-border-default);
+		border-radius: 4px;
+		background: var(--color-canvas-default);
+		color: var(--color-fg-default);
+		font: inherit;
+		font-size: 12px;
+		cursor: pointer;
+	}
+
+	:global(.markdown-pdf-actions button:hover) {
+		background: var(--color-neutral-muted);
+	}
+
+	:global(.markdown-pdf-frame) {
+		display: block;
+		width: 100%;
+		height: var(--pdf-height, 720px);
+		border: 0;
+		background: var(--color-canvas-default);
+	}
+
+	:global(.markdown-pdf-collapsed .markdown-pdf-frame) {
+		display: none;
+	}
+
+	:global(.markdown-pdf-embed:fullscreen) {
+		width: 100%;
+		height: 100%;
+		max-width: none;
+		margin: 0;
+		border-radius: 0;
+		border: none;
+		background: var(--color-canvas-default);
+	}
+
+	:global(.markdown-pdf-embed:fullscreen .markdown-pdf-frame) {
+		height: calc(100% - 43px);
 	}
 
 	:global(.mermaid-diagram) {

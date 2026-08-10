@@ -27,6 +27,7 @@
 		onexit,
 		ontoggleHome,
 		ononpenFileLocation,
+		oncopyFilePath,
 		ontoggleLiveMode,
 
 		ontoggleEdit,
@@ -63,6 +64,7 @@
 		onexit?: () => void;
 		ontoggleHome: () => void;
 		ononpenFileLocation: () => void;
+		oncopyFilePath?: () => void;
 		ontoggleLiveMode: () => void;
 
 		ontoggleEdit: () => void;
@@ -184,17 +186,16 @@
 
 		if (tabManager.activeTab && !showHome) {
 			list.push('back', 'forward');
-			if (currentFile) list.push('open_loc');
+			if (currentFile) list.push('open_loc', 'copy_path');
 
 			const ext = currentFile ? currentFile.split('.').pop()?.toLowerCase() || '' : 'md';
 			const isMarkdown = ['md', 'markdown', 'mdown', 'mkd'].includes(ext);
 
 			if (isMarkdown) {
+				list.push('live');
+
 				if (!isSplit) {
 					list.push('fullWidth');
-					if (!isEditing && currentFile) {
-						list.push('live');
-					}
 					list.push('edit');
 				}
 				if (isSplit) {
@@ -524,6 +525,18 @@
 							></svg>
 						<span class="action-label">Open Location</span>
 					</button>
+				{:else if id === 'copy_path'}
+					<button
+						class="title-action-btn"
+						onclick={() => oncopyFilePath?.()}
+						aria-label="Copy File Path"
+						onmouseenter={(e) => showTooltip(e, 'Copy file path')}
+						onmouseleave={hideTooltip}
+						transition:fly={{ x: 10, duration: 200 }}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+							><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+						<span class="action-label">Copy Path</span>
+					</button>
 				{:else if id === 'back'}
 					<button
 						class="title-action-btn"
@@ -605,6 +618,7 @@
 				{:else if id === 'live'}
 					<button
 						class="title-action-btn {liveMode ? 'active' : ''}"
+						disabled={!currentFile}
 						onclick={ontoggleLiveMode}
 						aria-label="Toggle Auto-Reload"
 						onmouseenter={(e) => showTooltip(e, 'Auto-Reload')}
